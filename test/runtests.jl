@@ -166,13 +166,72 @@ branches:
   - [C, 0, 1, EC=0.5]
 """
         circ = Circuit(desc; ncut=30)
-        sd = get_spectrum_vs_paramvals(circ, :flux, [0.0, Float64(π)]; evals_count=3)
+        sd = get_spectrum_vs_paramvals(circ, Symbol("Φ1"), [0.0, Float64(π)]; evals_count=3)
         # At Φ=0, full EJ; at Φ=π, EJ→0 so ω01 → small
         w01_0 = sd.eigenvalues[1, 2] - sd.eigenvalues[1, 1]
         w01_pi = sd.eigenvalues[2, 2] - sd.eigenvalues[2, 1]
         @test w01_0 > w01_pi
         @test w01_0 > 5.0   # should be well in transmon regime
         @test w01_pi < 3.0   # near charge regime at frustration
+    end
+
+    @testset "Circuit scqubits-style indexed parameters" begin
+        desc = """
+branches:
+  - [JJ, 0, 1, EJ=4.5, EC=0.1]
+  - [JJ, 1, 0, EJ=10.5, EC=0.1]
+  - [C, 1, 0, EC=0.2]
+  - [C, 1, 2, EC=5.0]
+  - [JJ, 0, 2, EJ=30.0, EC=0.1]
+  - [JJ, 2, 0, EJ=20.0, EC=0.1]
+  - [C, 2, 0, EC=0.1]
+  - [C, 2, 3, EC=5.0]
+  - [JJ, 0, 3, EJ=4.6, EC=0.1]
+  - [JJ, 3, 0, EJ=10.0, EC=0.1]
+  - [C, 3, 0, EC=0.2]
+"""
+        circ = Circuit(desc; ncut=6)
+
+        @test string.(external_fluxes(circ)) == ["Φ1", "Φ2", "Φ3"]
+        @test string.(offset_charges(circ)) == ["ng1", "ng2", "ng3"]
+        flux_map = sym_external_fluxes(circ)
+        @test length(flux_map) == 3
+        for (k, flux) in enumerate(external_fluxes(circ))
+            @test haskey(flux_map, flux)
+            @test flux_map[flux].closure_branch == circ.symbolic_circuit.superconducting_closure_branches[k]
+            @test flux_map[flux].loop == circ.symbolic_circuit.superconducting_loops[k]
+        end
+        @test occursin("Φ1", string(sym_hamiltonian(circ)))
+        @test occursin("Φ1", string(sym_hamiltonian_node(circ)))
+        @test !occursin("Φext", string(sym_hamiltonian(circ)))
+        @test !occursin("Φext", string(sym_hamiltonian_node(circ)))
+
+        set_param!(circ, Symbol("Φ2"), 0.3)
+        @test get_param(circ, Symbol("Φ2")) == 0.3
+
+        set_param!(circ, :ng2, 0.125)
+        @test get_param(circ, :ng2) == 0.125
+
+        phi_vals = [0.0, π / 4, π / 2]
+        sd_sym = get_spectrum_vs_paramvals(circ, Symbol("Φ2"), phi_vals; evals_count=2)
+        @test size(sd_sym.eigenvalues) == (3, 2)
+        @test get_param(circ, Symbol("Φ2")) == 0.3
+
+        sd_str = get_spectrum_vs_paramvals(circ, "Φ2", phi_vals; evals_count=2)
+        @test sd_str.param_name == Symbol("Φ2")
+        @test sd_str.eigenvalues ≈ sd_sym.eigenvalues
+
+        ps = ParameterSweep(circ, "Φ2", phi_vals; evals_count=2)
+        @test ps.param_name == Symbol("Φ2")
+
+        @test_throws ErrorException set_param!(circ, Symbol("Φext_2"), 0.1)
+        @test_throws ErrorException get_param(circ, Symbol("Φext_2"))
+        @test_throws ErrorException set_param!(circ, :ng_2, 0.1)
+        @test_throws ErrorException get_param(circ, :ng_2)
+        @test_throws ErrorException set_param!(circ, Symbol("Φ99"), 0.1)
+        @test_throws ErrorException get_param(circ, Symbol("Φ99"))
+        @test_throws ErrorException set_param!(circ, :ng99, 0.1)
+        @test_throws ErrorException get_param(circ, :ng99)
     end
 
     @testset "SpectrumLookup" begin

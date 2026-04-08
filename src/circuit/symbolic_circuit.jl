@@ -17,6 +17,8 @@ struct SymbolicCircuit
     spanning_tree::Vector{Int}
     closure_branches::Vector{Int}
     loops::Vector{Vector{Tuple{Int, Int}}}
+    superconducting_closure_branches::Vector{Int}
+    superconducting_loops::Vector{Vector{Tuple{Int, Int}}}
 
     # Symbolic node variables
     node_vars::Vector{Num}         # φ_1, φ_2, ... (node fluxes)
@@ -72,11 +74,11 @@ function build_symbolic_circuit(cg::CircuitGraph)
     node_vars = Num[Symbolics.variable(:φ, i) for i in 1:n]
     node_dot_vars = Num[Symbolics.variable(:φ̇, i) for i in 1:n]
 
-    # External fluxes: one per superconducting closure branch
-    ext_fluxes = Num[Symbolics.variable(:Φext, i) for i in 1:n_ext]
+    # scqubits-style symbolic names: Φ1, Φ2, ... and ng1, ng2, ...
+    ext_fluxes = Num[Num(Symbolics.variable(Symbol("Φ$(i)"))) for i in 1:n_ext]
 
     # Offset charges: one per node (for periodic variables)
-    offset_charges = Num[Symbolics.variable(:ng, i) for i in 1:n]
+    offset_charges = Num[Num(Symbolics.variable(Symbol("ng$(i)"))) for i in 1:n]
 
     # Branch flux allocations: per-branch symbolic flux
     branch_flux_alloc = _build_branch_flux_allocations(cg, sc_closure_indices, ext_fluxes)
@@ -106,7 +108,7 @@ function build_symbolic_circuit(cg::CircuitGraph)
     H_symbolic = Symbolics.simplify(H_charge + H_inductive + H_josephson)
 
     return SymbolicCircuit(
-        cg, tree, closure, loops,
+        cg, tree, closure, loops, sc_closure_indices, sc_loops,
         node_vars, node_dot_vars,
         C_mat, L_inv,
         H_symbolic, EC_mat,
@@ -174,7 +176,7 @@ end
     _build_branch_flux_allocations(cg, sc_closure_indices, ext_fluxes)
 
 Compute per-branch external flux allocation. Each closure branch in the
-superconducting subgraph receives its corresponding `Φext_k`; all other
+superconducting subgraph receives its corresponding `Φ_k`; all other
 branches receive 0.
 
 Returns a `Vector{Num}` of length `length(cg.branches)`.

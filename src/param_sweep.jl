@@ -29,6 +29,14 @@ function ParameterSweep(sys::AbstractQuantumSystem, param_name::Symbol,
     return ParameterSweep(sys, param_name, collect(Float64, param_vals), spectrum)
 end
 
+function ParameterSweep(sys::AbstractQuantumSystem, param_name::AbstractString,
+                        param_vals::AbstractVector;
+                        evals_count::Int=6, store_eigvecs::Bool=false)
+    ParameterSweep(sys, Symbol(param_name), param_vals;
+                   evals_count=evals_count,
+                   store_eigvecs=store_eigvecs)
+end
+
 # ──────────────────────────────────────────────────────────────────────────────
 # HilbertSpaceSweep: parameter sweep over a composite HilbertSpace
 # ──────────────────────────────────────────────────────────────────────────────

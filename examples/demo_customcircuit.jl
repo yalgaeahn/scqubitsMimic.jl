@@ -100,6 +100,7 @@ println("  This forms a SQUID loop with tunable EJ")
 println("\nSymbolic Hamiltonian:")
 println("  ", sym_hamiltonian(circ3))
 println("External flux variables: ", external_fluxes(circ3))
+println("Flux loop map: ", sym_external_fluxes(circ3))
 
 # Flux sweep
 println("\nSpectrum vs external flux:")
@@ -115,7 +116,7 @@ for phi in range(0.0, π, length=11)
 end
 
 # Use get_spectrum_vs_paramvals for automated sweep
-sd3 = get_spectrum_vs_paramvals(circ3, :flux, range(0.0, π, length=21); evals_count=4)
+sd3 = get_spectrum_vs_paramvals(circ3, Symbol("Φ1"), range(0.0, π, length=21); evals_count=4)
 println("\nSweep completed: $(length(sd3.param_vals)) points, $(size(sd3.eigenvalues, 2)) eigenvalues each")
 
 # =============================================================================
@@ -177,4 +178,3 @@ for i in 1:6
 end
 println("\n  Maximum difference: $(maximum(abs.(e_circ .- e_tmon)))")
 println("  Validation: ", maximum(abs.(e_circ .- e_tmon)) < 1e-10 ? "PASSED" : "FAILED")
-

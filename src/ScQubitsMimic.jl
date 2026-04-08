@@ -72,7 +72,7 @@ export compute_variable_transformation, VarCategories
 export Circuit, set_external_flux!, set_offset_charge!, invalidate_cache!,
        list_branch_params
 export sym_hamiltonian, sym_hamiltonian_node, variable_transformation,
-       external_fluxes, offset_charges
+       external_fluxes, sym_external_fluxes, offset_charges
 export SubCircuit, HierarchyLeaf, HierarchyGroup, HierarchyNode, hierarchical_diag
 
 # Circuit operators

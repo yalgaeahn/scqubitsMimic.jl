@@ -143,6 +143,29 @@ variable_transformation(circ::Circuit) = (circ.transformation_matrix, circ.var_c
 """Return the symbolic external flux variables."""
 external_fluxes(circ::Circuit) = circ.symbolic_circuit.external_fluxes
 
+"""
+    sym_external_fluxes(circ::Circuit)
+
+Return a scqubits-style loop-to-flux mapping for the superconducting loops
+identified during symbolic circuit construction.
+
+The returned dictionary is keyed by the symbolic flux variables `Φ1`, `Φ2`, ...
+and each value is a named tuple with:
+- `closure_branch::Int` — the closure branch carrying that flux variable
+- `loop::Vector{Tuple{Int,Int}}` — the corresponding fundamental loop as
+  `(branch_index, sign)` pairs
+"""
+function sym_external_fluxes(circ::Circuit)
+    sc = circ.symbolic_circuit
+    mapping = Dict{Num, NamedTuple{(:closure_branch, :loop), Tuple{Int, Vector{Tuple{Int, Int}}}}}()
+    for (flux, closure_branch, loop) in zip(sc.external_fluxes,
+                                            sc.superconducting_closure_branches,
+                                            sc.superconducting_loops)
+        mapping[flux] = (closure_branch=closure_branch, loop=copy(loop))
+    end
+    return mapping
+end
+
 """Return the symbolic offset charge variables."""
 offset_charges(circ::Circuit) = circ.symbolic_circuit.offset_charges
 
@@ -162,22 +185,36 @@ end
 
 # ── set_param! / get_param for parameter sweeps ─────────────────────────────
 
-function set_param!(circ::Circuit, param_name::Symbol, val)
+function _circuit_flux_index(circ::Circuit, param_name::Symbol)
     s = string(param_name)
-    if param_name == :flux || param_name == :Φext
-        set_external_flux!(circ, 1, Float64(val))
-    elseif startswith(s, "Φext_")
-        idx = parse(Int, s[6:end])
+    m = match(r"^Φ(\d+)$", s)
+    m === nothing && return nothing
+    idx = parse(Int, m.captures[1])
+    1 <= idx <= length(circ.external_flux_values) ||
+        error("External flux index $idx out of range for circuit with $(length(circ.external_flux_values)) flux parameters")
+    return idx
+end
+
+function _circuit_charge_index(circ::Circuit, param_name::Symbol)
+    s = string(param_name)
+    m = match(r"^ng(\d+)$", s)
+    m === nothing && return nothing
+    idx = parse(Int, m.captures[1])
+    1 <= idx <= length(circ.offset_charge_values) ||
+        error("Offset charge index $idx out of range for circuit with $(length(circ.offset_charge_values)) charge parameters")
+    return idx
+end
+
+function set_param!(circ::Circuit, param_name::Symbol, val)
+    if (idx = _circuit_flux_index(circ, param_name)) !== nothing
         set_external_flux!(circ, idx, Float64(val))
-    elseif param_name == :ng
-        set_offset_charge!(circ, 1, Float64(val))
-    elseif startswith(s, "ng_")
-        idx = parse(Int, s[4:end])
+    elseif (idx = _circuit_charge_index(circ, param_name)) !== nothing
         set_offset_charge!(circ, idx, Float64(val))
     elseif param_name in (:EJ, :EC, :EL)
         _set_branch_param_first!(circ, param_name, Float64(val))
         invalidate_cache!(circ)
-    elseif (m = match(r"^(EJ|EC|EL)_(\d+)$", s)) !== nothing
+        return
+    elseif (m = match(r"^(EJ|EC|EL)_(\d+)$", string(param_name))) !== nothing
         pname = Symbol(m.captures[1])
         branch_idx = parse(Int, m.captures[2])
         1 <= branch_idx <= length(circ.symbolic_circuit.graph.branches) ||
@@ -186,30 +223,24 @@ function set_param!(circ::Circuit, param_name::Symbol, val)
         invalidate_cache!(circ)
     else
         error("Circuit parameter :$param_name not recognized. " *
-              "Use :flux, :Φext, :Φext_N, :ng, :ng_N, :EJ, :EC, :EL, :EJ_N, :EC_N, :EL_N")
+              "Use :Φ1, :Φ2, ..., :ng1, :ng2, ..., :EJ, :EC, :EL, :EJ_N, :EC_N, :EL_N")
     end
 end
 
 function get_param(circ::Circuit, param_name::Symbol)
-    s = string(param_name)
-    if param_name == :flux || param_name == :Φext
-        return circ.external_flux_values[1]
-    elseif startswith(s, "Φext_")
-        idx = parse(Int, s[6:end])
+    if (idx = _circuit_flux_index(circ, param_name)) !== nothing
         return circ.external_flux_values[idx]
-    elseif param_name == :ng
-        return circ.offset_charge_values[1]
-    elseif startswith(s, "ng_")
-        idx = parse(Int, s[4:end])
+    elseif (idx = _circuit_charge_index(circ, param_name)) !== nothing
         return circ.offset_charge_values[idx]
     elseif param_name in (:EJ, :EC, :EL)
         return _get_branch_param_first(circ, param_name)
-    elseif (m = match(r"^(EJ|EC|EL)_(\d+)$", s)) !== nothing
+    elseif (m = match(r"^(EJ|EC|EL)_(\d+)$", string(param_name))) !== nothing
         pname = Symbol(m.captures[1])
         branch_idx = parse(Int, m.captures[2])
         return _get_branch_param(circ, branch_idx, pname)
     else
-        error("Circuit parameter :$param_name not recognized")
+        error("Circuit parameter :$param_name not recognized. " *
+              "Use :Φ1, :Φ2, ..., :ng1, :ng2, ..., :EJ, :EC, :EL, :EJ_N, :EC_N, :EL_N")
     end
 end
 

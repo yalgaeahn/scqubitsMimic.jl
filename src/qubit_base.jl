@@ -91,6 +91,10 @@ function set_param!(sys::AbstractQuantumSystem, param_name::Symbol, val)
     setfield!(sys, param_name, val)
 end
 
+function set_param!(sys::AbstractQuantumSystem, param_name::AbstractString, val)
+    set_param!(sys, Symbol(param_name), val)
+end
+
 """
     get_param(sys::AbstractQuantumSystem, param_name::Symbol)
 
@@ -98,6 +102,10 @@ Get a parameter from a quantum system. Default uses `getfield`.
 """
 function get_param(sys::AbstractQuantumSystem, param_name::Symbol)
     getfield(sys, param_name)
+end
+
+function get_param(sys::AbstractQuantumSystem, param_name::AbstractString)
+    get_param(sys, Symbol(param_name))
 end
 
 """
@@ -132,4 +140,14 @@ function get_spectrum_vs_paramvals(sys::AbstractQuantumSystem,
 
     return SpectrumData(param_name, collect(Float64, param_vals),
                         eigenvalues, eigvec_store)
+end
+
+function get_spectrum_vs_paramvals(sys::AbstractQuantumSystem,
+                                   param_name::AbstractString,
+                                   param_vals::AbstractVector;
+                                   evals_count::Int=6,
+                                   store_eigvecs::Bool=false)
+    get_spectrum_vs_paramvals(sys, Symbol(param_name), param_vals;
+                              evals_count=evals_count,
+                              store_eigvecs=store_eigvecs)
 end
