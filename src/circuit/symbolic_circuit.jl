@@ -36,6 +36,10 @@ struct SymbolicCircuit
     external_fluxes::Vector{Num}
     offset_charges::Vector{Num}
 
+    # Per-branch external flux allocation (length = n_branches)
+    # Each entry is the symbolic external flux for that branch (0 for non-closure branches)
+    branch_flux_allocations::Vector{Num}
+
     # Josephson terms (symbolic): list of (EJ_value, phase_expression)
     josephson_terms::Vector{Tuple{Num, Num}}
 end
@@ -54,38 +58,41 @@ function build_symbolic_circuit(cg::CircuitGraph)
     n = cg.num_nodes
     n > 0 || throw(ArgumentError("Circuit must have at least one non-ground node"))
 
-    # Topology
+    # Topology on full graph (needed for capacitance matrix, mode decomposition, etc.)
     tree = find_spanning_tree(cg)
     closure = find_closure_branches(cg, tree)
     loops = find_fundamental_loops(cg, tree)
+
+    # Superconducting loops: exclude capacitive branches to find physical flux loops
+    sc_closure_indices, sc_loops = find_superconducting_loops(cg)
+    n_ext = length(sc_closure_indices)
 
     # Symbolic node flux variables
     @variables t
     node_vars = Num[Symbolics.variable(:φ, i) for i in 1:n]
     node_dot_vars = Num[Symbolics.variable(:φ̇, i) for i in 1:n]
 
-    # External fluxes: one per loop with inductive/JJ elements
-    n_ext = _count_flux_loops(cg, loops)
+    # External fluxes: one per superconducting closure branch
     ext_fluxes = Num[Symbolics.variable(:Φext, i) for i in 1:n_ext]
 
     # Offset charges: one per node (for periodic variables)
     offset_charges = Num[Symbolics.variable(:ng, i) for i in 1:n]
+
+    # Branch flux allocations: per-branch symbolic flux
+    branch_flux_alloc = _build_branch_flux_allocations(cg, sc_closure_indices, ext_fluxes)
 
     # Build matrices
     C_mat = _build_capacitance_matrix(cg, n)
     L_inv = _build_inv_inductance_matrix(cg, n)
 
     # Charging energy matrix: EC = (1/2) * C⁻¹
-    # Use symbolic inversion for small matrices, numerical for larger
     C_inv = _symbolic_matrix_inverse(C_mat)
     EC_mat = C_inv ./ 2
 
-    # Josephson terms
-    jj_terms = _build_josephson_terms(cg, node_vars, ext_fluxes, loops)
+    # Josephson terms: use branch flux allocations (no loop search)
+    jj_terms = _build_josephson_terms(cg, node_vars, branch_flux_alloc)
 
     # Symbolic Hamiltonian: H = (1/2) Q^T C⁻¹ Q + (1/2) φ^T L⁻¹ φ - Σ EJ cos(...)
-    # In terms of charge operators: H_charge = Σ_{ij} 4*EC[i,j] * n_i * n_j
-    # (factor of 4 from convention: EC = e²/(2C), and n is Cooper pair number)
     charge_vars = [Symbolics.variable(:n, i) for i in 1:n]
 
     H_charge = sum(4 * EC_mat[i, j] * charge_vars[i] * charge_vars[j]
@@ -107,6 +114,7 @@ function build_symbolic_circuit(cg::CircuitGraph)
         C_mat, L_inv,
         H_symbolic, EC_mat,
         ext_fluxes, offset_charges,
+        branch_flux_alloc,
         jj_terms
     )
 end
@@ -163,38 +171,39 @@ function _build_inv_inductance_matrix(cg::CircuitGraph, n::Int)
     return L_inv
 end
 
+# ── Branch flux allocations ──────────────────────────────────────────────────
+
+"""
+    _build_branch_flux_allocations(cg, sc_closure_indices, ext_fluxes)
+
+Compute per-branch external flux allocation. Each closure branch in the
+superconducting subgraph receives its corresponding `Φext_k`; all other
+branches receive 0.
+
+Returns a `Vector{Num}` of length `length(cg.branches)`.
+"""
+function _build_branch_flux_allocations(cg::CircuitGraph,
+                                         sc_closure_indices::Vector{Int},
+                                         ext_fluxes::Vector{Num})
+    n_branches = length(cg.branches)
+    alloc = fill(Num(0), n_branches)
+    for (k, ci) in enumerate(sc_closure_indices)
+        alloc[ci] = ext_fluxes[k]
+    end
+    return alloc
+end
+
 # ── Josephson terms ──────────────────────────────────────────────────────────
 
 function _build_josephson_terms(cg::CircuitGraph, node_vars::Vector{Num},
-                                ext_fluxes::Vector{Num},
-                                loops::Vector{Vector{Tuple{Int, Int}}})
+                                branch_flux_alloc::Vector{Num})
     terms = Tuple{Num, Num}[]
-    flux_idx = 0
-
-    # Identify which loops contain JJ or L branches (carry external flux)
-    loop_has_flux = _loops_with_flux(cg, loops)
-
-    for b in cg.branches
+    for (bi, b) in enumerate(cg.branches)
         b.branch_type == JJ_branch || continue
         ej = Num(b.parameters[:EJ])
-
-        # Phase difference across junction: φ_j - φ_i
-        phase = _branch_phase(b, node_vars)
-
-        # Add external flux if this junction is in a loop
-        for (li, loop) in enumerate(loops)
-            if loop_has_flux[li] && any(bi == findfirst(==(b), cg.branches) for (bi, _) in loop)
-                flux_idx += 1
-                if flux_idx <= length(ext_fluxes)
-                    phase = phase - ext_fluxes[flux_idx]
-                end
-                break
-            end
-        end
-
+        phase = _branch_phase(b, node_vars) + branch_flux_alloc[bi]
         push!(terms, (ej, phase))
     end
-
     return terms
 end
 
@@ -209,25 +218,6 @@ function _branch_phase(b::Branch, node_vars::Vector{Num})
     return phase
 end
 
-function _count_flux_loops(cg::CircuitGraph, loops)
-    count = 0
-    for loop in loops
-        for (bi, _) in loop
-            b = cg.branches[bi]
-            if b.branch_type in (L_branch, JJ_branch)
-                count += 1
-                break
-            end
-        end
-    end
-    return count
-end
-
-function _loops_with_flux(cg::CircuitGraph, loops)
-    return [any(cg.branches[bi].branch_type in (L_branch, JJ_branch)
-                for (bi, _) in loop)
-            for loop in loops]
-end
 
 # ── Symbolic matrix inverse ──────────────────────────────────────────────────
 

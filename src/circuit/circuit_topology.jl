@@ -170,6 +170,48 @@ function _find_tree_path(adj, start::Int, target::Int, n::Int)
 end
 
 """
+    find_superconducting_loops(cg::CircuitGraph)
+
+Find fundamental loops in the superconducting subgraph (JJ and L branches only).
+Capacitive branches are excluded so that only physical superconducting loops
+(which support flux quantization) are detected.
+
+Returns `(closure_indices, loops)` where:
+- `closure_indices::Vector{Int}` — indices into `cg.branches` of closure branches
+- `loops::Vector{Vector{Tuple{Int,Int}}}` — fundamental loops with branch indices
+  mapped back to `cg.branches`
+"""
+function find_superconducting_loops(cg::CircuitGraph)
+    # 1. Identify superconducting branch indices (JJ and L only)
+    sc_indices = [i for (i, b) in enumerate(cg.branches)
+                  if b.branch_type in (JJ_branch, L_branch)]
+
+    if isempty(sc_indices)
+        return (Int[], Vector{Vector{Tuple{Int,Int}}}())
+    end
+
+    # 2. Build a sub-CircuitGraph with only those branches
+    sc_branches = cg.branches[sc_indices]
+    sc_graph = CircuitGraph(sc_branches; has_ground=cg.has_ground)
+
+    # 3. Find spanning tree on the superconducting subgraph
+    sc_tree = find_spanning_tree(sc_graph; prefer_capacitive=false)
+
+    # 4. Closure branches in the subgraph
+    sc_closure = find_closure_branches(sc_graph, sc_tree)
+
+    # 5. Map closure branch indices back to original cg.branches
+    closure_in_original = [sc_indices[ci] for ci in sc_closure]
+
+    # 6. Find fundamental loops and map branch indices back to original
+    sc_loops = find_fundamental_loops(sc_graph, sc_tree)
+    loops_in_original = [[(sc_indices[bi], sign) for (bi, sign) in loop]
+                          for loop in sc_loops]
+
+    return (closure_in_original, loops_in_original)
+end
+
+"""
     loop_to_node_vector(cg::CircuitGraph, loop::Vector{Tuple{Int,Int}})
 
 Convert a loop (list of (branch_index, sign) pairs) to a vector in node-flux space.
