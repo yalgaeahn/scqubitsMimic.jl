@@ -72,7 +72,7 @@ export Circuit, set_external_flux!, set_offset_charge!, invalidate_cache!,
        list_branch_params
 export sym_hamiltonian, sym_hamiltonian_node, variable_transformation,
        external_fluxes, offset_charges
-export SubCircuit, hierarchical_diag
+export SubCircuit, HierarchyLeaf, HierarchyGroup, HierarchyNode, hierarchical_diag
 
 # Circuit operators
 export n_operator_periodic, exp_i_theta_operator,
@@ -93,7 +93,7 @@ export n_operator, exp_i_phi_operator, cos_phi_operator, sin_phi_operator, poten
 
 # Composite systems
 export HilbertSpace, InteractionTerm, ParameterSweep, HilbertSpaceSweep, SpectrumLookup
-export add_interaction!, diag!
+export add_interaction!, add_operator!, diag!
 export generate_lookup!, dressed_index, bare_index,
        energy_by_dressed_index, energy_by_bare_index,
        op_in_dressed_eigenbasis

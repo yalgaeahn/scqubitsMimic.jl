@@ -522,6 +522,27 @@ function _extract_phase_info(circ::Circuit, phase_sym::Num,
     return coeffs, const_phase
 end
 
+"""
+Build `exp(i * c * θ)` for a single mode, using the best available method.
+Returns a sparse matrix in the mode's Hilbert space.
+"""
+function _build_single_mode_exp(circ::Circuit, mop::ModeOperators,
+                                 mode::Int, c::Float64)
+    if abs(c) < 1e-15
+        dim = size(mop.n_op, 1)
+        return sparse(ComplexF64(1.0) * I, dim, dim)
+    elseif mode in circ.var_categories.periodic && abs(c) ≈ 1.0
+        return c > 0 ? mop.exp_ip_op : sparse(mop.exp_ip_op')
+    else
+        phi = mop.phi_op
+        if iszero(phi)
+            return c > 0 ? mop.exp_ip_op : sparse(mop.exp_ip_op')
+        else
+            return sparse(exp(Matrix(1im * c * phi)))
+        end
+    end
+end
+
 function _build_cos_operator(circ::Circuit, phase_coeffs::Dict{Int, Float64},
                               ext_phase::Float64,
                               active_modes::Vector{Int}, dims::Vector{Int},

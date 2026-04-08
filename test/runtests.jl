@@ -391,6 +391,206 @@ branches:
             system_hierarchy=[[1]], subsystem_trunc_dims=Dict(1=>5))
     end
 
+    @testset "Hierarchical diag: cross-group capacitive coupling (factor-of-2)" begin
+        # With full truncation (no truncation), hierarchical must match full diag exactly
+        desc = """
+branches:
+  - [JJ, 0, 1, EJ=10.0, EC=0.3]
+  - [JJ, 0, 2, EJ=8.0, EC=0.4]
+  - [C, 1, 2, EC=0.1]
+"""
+        circ = Circuit(desc; ncut=15)
+        nstates = 2 * 15 + 1   # full dim for periodic mode with ncut=15
+
+        evals_full = eigenvals(circ; evals_count=6)
+        evals_full .-= evals_full[1]
+
+        hs = hierarchical_diag(circ;
+            system_hierarchy=[[1], [2]],
+            subsystem_trunc_dims=Dict(1=>nstates, 2=>nstates))
+        evals_hier = eigenvals(hs; evals_count=6)
+        evals_hier .-= evals_hier[1]
+
+        # With no truncation, must be exact (up to floating point)
+        @test evals_hier ≈ evals_full atol=1e-8
+    end
+
+    @testset "Hierarchical diag: cross-group Josephson coupling" begin
+        desc = """
+branches:
+  - [JJ, 0, 1, EJ=10.0, EC=0.3]
+  - [JJ, 0, 2, EJ=8.0, EC=0.4]
+  - [JJ, 1, 2, EJ=2.0, EC=0.05]
+"""
+        circ = Circuit(desc; ncut=15)
+        nstates = 2 * 15 + 1
+
+        evals_full = eigenvals(circ; evals_count=6)
+        evals_full .-= evals_full[1]
+
+        hs = hierarchical_diag(circ;
+            system_hierarchy=[[1], [2]],
+            subsystem_trunc_dims=Dict(1=>nstates, 2=>nstates))
+        evals_hier = eigenvals(hs; evals_count=6)
+        evals_hier .-= evals_hier[1]
+
+        # With full truncation dims, cross-group Josephson should match exactly
+        @test evals_hier ≈ evals_full atol=1e-8
+
+        # With truncated dims (15 per mode), should still be close (<5%)
+        hs_trunc = hierarchical_diag(circ;
+            system_hierarchy=[[1], [2]],
+            subsystem_trunc_dims=Dict(1=>15, 2=>15))
+        evals_trunc = eigenvals(hs_trunc; evals_count=6)
+        evals_trunc .-= evals_trunc[1]
+        for i in 2:6
+            @test abs(evals_trunc[i] - evals_full[i]) / abs(evals_full[i]) < 0.05
+        end
+    end
+
+    @testset "Hierarchical diag: cross-group inductive coupling" begin
+        # Fluxonium-like modes with cross inductor
+        desc = """
+branches:
+  - [JJ, 0, 1, EJ=8.0, EC=2.5]
+  - [L, 0, 1, EL=0.5]
+  - [JJ, 0, 2, EJ=6.0, EC=2.0]
+  - [L, 0, 2, EL=0.4]
+  - [L, 1, 2, EL=0.05]
+"""
+        circ = Circuit(desc; ncut=15, ext_basis=:harmonic)
+        nstates_full = circ.cutoffs[first(vcat(circ.var_categories.periodic, circ.var_categories.extended))]
+
+        evals_full = eigenvals(circ; evals_count=6)
+        evals_full .-= evals_full[1]
+
+        # With generous truncation, should be within 10%
+        hs = hierarchical_diag(circ;
+            system_hierarchy=[[1], [2]],
+            subsystem_trunc_dims=Dict(1=>nstates_full, 2=>nstates_full))
+        evals_hier = eigenvals(hs; evals_count=6)
+        evals_hier .-= evals_hier[1]
+
+        @test evals_hier ≈ evals_full atol=1e-6
+    end
+
+    @testset "Hierarchical diag: add_operator! and extra_H_terms" begin
+        # Test that add_operator! properly adds terms to Hamiltonian
+        t = Transmon(EJ=10.0, EC=0.3, ng=0.0, ncut=5)
+        hs = HilbertSpace([t])
+        evals_before = eigenvals(hs; evals_count=4)
+
+        # Add the bare Hamiltonian again as a perturbation (doubles it)
+        add_operator!(hs, hamiltonian(t))
+
+        evals_after = eigenvals(hs; evals_count=4)
+        # Eigenvalues should be doubled (H + H = 2H)
+        @test evals_after ≈ 2 .* evals_before rtol=1e-8
+        @test length(hs.extra_H_terms) == 1
+    end
+
+    @testset "Hierarchical diag: nested (recursive) hierarchy" begin
+        # 3-mode circuit with weak inter-mode capacitive coupling
+        desc = """
+branches:
+  - [JJ, 0, 1, EJ=10.0, EC=0.3]
+  - [JJ, 0, 2, EJ=8.0, EC=0.4]
+  - [JJ, 0, 3, EJ=6.0, EC=0.5]
+  - [C, 1, 2, EC=0.08]
+  - [C, 2, 3, EC=0.06]
+"""
+        circ = Circuit(desc; ncut=5)
+        nstates = 2 * 5 + 1  # dim=11 per mode
+
+        # Full diag reference
+        evals_full = eigenvals(circ; evals_count=6)
+        evals_full .-= evals_full[1]
+
+        # Flat hierarchy: [[1], [2], [3]] with full truncation → exact
+        hs_flat = hierarchical_diag(circ;
+            system_hierarchy=[[1], [2], [3]],
+            subsystem_trunc_dims=Dict(1=>nstates, 2=>nstates, 3=>nstates))
+        evals_flat = eigenvals(hs_flat; evals_count=6)
+        evals_flat .-= evals_flat[1]
+        @test evals_flat ≈ evals_full atol=1e-6
+
+        # Nested hierarchy: [[[1], [2]], [3]]
+        # Full-dim leaves + generous intermediate truncation → near-exact
+        hs_nested = hierarchical_diag(circ;
+            system_hierarchy=[[[1], [2]], [3]],
+            subsystem_trunc_dims=Dict(
+                (1,1) => nstates,   # leaf [1]
+                (1,2) => nstates,   # leaf [2]
+                (1,)  => nstates^2, # intermediate: keep all states
+                (2,)  => nstates))  # leaf [3]
+        evals_nested = eigenvals(hs_nested; evals_count=6)
+        evals_nested .-= evals_nested[1]
+        @test evals_nested ≈ evals_full atol=1e-6
+
+        # Truncated nested: [[[1],[2]], [3]] with real truncation
+        hs_trunc = hierarchical_diag(circ;
+            system_hierarchy=[[[1], [2]], [3]],
+            subsystem_trunc_dims=Dict(
+                (1,1) => 8,    # leaf [1]
+                (1,2) => 8,    # leaf [2]
+                (1,)  => 12,   # intermediate group
+                (2,)  => 8))   # leaf [3]
+        evals_trunc = eigenvals(hs_trunc; evals_count=6)
+        evals_trunc .-= evals_trunc[1]
+        for i in 2:4
+            @test abs(evals_trunc[i] - evals_full[i]) / abs(evals_full[i]) < 0.2
+        end
+    end
+
+    @testset "Hierarchical diag: nested with HierarchyGroup API" begin
+        desc = """
+branches:
+  - [JJ, 0, 1, EJ=10.0, EC=0.3]
+  - [JJ, 0, 2, EJ=8.0, EC=0.4]
+  - [C, 1, 2, EC=0.1]
+"""
+        circ = Circuit(desc; ncut=15)
+        nstates = 2 * 15 + 1
+
+        evals_full = eigenvals(circ; evals_count=6)
+        evals_full .-= evals_full[1]
+
+        # Use explicit HierarchyGroup/HierarchyLeaf types
+        hier = HierarchyGroup([HierarchyLeaf([1]), HierarchyLeaf([2])])
+        td = Dict((1,) => nstates, (2,) => nstates)
+        hs = hierarchical_diag(circ;
+            system_hierarchy=hier,
+            subsystem_trunc_dims=td)
+        evals_hier = eigenvals(hs; evals_count=6)
+        evals_hier .-= evals_hier[1]
+
+        @test evals_hier ≈ evals_full atol=1e-8
+    end
+
+    @testset "Hierarchical diag: single-group hierarchy" begin
+        # Edge case: all modes in a single group
+        desc = """
+branches:
+  - [JJ, 0, 1, EJ=10.0, EC=0.3]
+  - [JJ, 0, 2, EJ=8.0, EC=0.4]
+  - [C, 1, 2, EC=0.1]
+"""
+        circ = Circuit(desc; ncut=10)
+
+        evals_full = eigenvals(circ; evals_count=4)
+        evals_full .-= evals_full[1]
+
+        # Single leaf group with all modes
+        hs = hierarchical_diag(circ;
+            system_hierarchy=[[1, 2]],
+            subsystem_trunc_dims=Dict(1=>20))
+        evals_hier = eigenvals(hs; evals_count=4)
+        evals_hier .-= evals_hier[1]
+
+        # With enough truncation, should be exact
+        @test evals_hier ≈ evals_full atol=1e-6
+    end
+
     @testset "Symbolic accessors" begin
         desc = """
 branches:

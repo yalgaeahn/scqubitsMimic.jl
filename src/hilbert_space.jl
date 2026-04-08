@@ -19,11 +19,12 @@ H = hamiltonian(hs)
 mutable struct HilbertSpace <: AbstractQuantumSystem
     subsystems::Vector{AbstractQuantumSystem}
     interactions::Vector{InteractionTerm}
+    extra_H_terms::Vector{QuantumObject}   # pre-built operators added directly to H
     lookup::Union{Nothing, SpectrumLookup}
 end
 
 HilbertSpace(subsystems::Vector{<:AbstractQuantumSystem}) =
-    HilbertSpace(collect(AbstractQuantumSystem, subsystems), InteractionTerm[], nothing)
+    HilbertSpace(collect(AbstractQuantumSystem, subsystems), InteractionTerm[], QuantumObject[], nothing)
 
 function hilbertdim(hs::HilbertSpace)
     return prod(hilbertdim(s) for s in hs.subsystems)
@@ -34,6 +35,11 @@ function add_interaction!(hs::HilbertSpace, g::Float64,
                           subsys_list::Vector{<:AbstractQuantumSystem},
                           op_list::Vector{Function})
     push!(hs.interactions, InteractionTerm(g, collect(AbstractQuantumSystem, subsys_list), op_list))
+end
+
+"""Add a pre-built operator directly to the Hamiltonian."""
+function add_operator!(hs::HilbertSpace, op::QuantumObject)
+    push!(hs.extra_H_terms, op)
 end
 
 function hamiltonian(hs::HilbertSpace)
@@ -55,6 +61,11 @@ function hamiltonian(hs::HilbertSpace)
         # Build tensor product of interaction operators
         interaction_op = _build_interaction_operator(hs, term)
         H = H + term.g_strength * interaction_op
+    end
+
+    # Pre-built operator terms (e.g., cross-group Josephson)
+    for op in hs.extra_H_terms
+        H = H + op
     end
 
     return H
