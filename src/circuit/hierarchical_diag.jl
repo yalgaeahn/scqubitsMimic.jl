@@ -11,8 +11,8 @@
 """
     HierarchyLeaf(mode_indices)
 
-A leaf node in a hierarchy specification: a group of mode indices
-(1-based into the active modes list) to be diagonalized together.
+A leaf node in a hierarchy specification: a group of actual variable indices
+(matching scqubits convention) to be diagonalized together.
 """
 struct HierarchyLeaf
     mode_indices::Vector{Int}
@@ -46,7 +46,7 @@ i.e., it is a diagonal matrix of size `truncated_dim × truncated_dim`.
 """
 struct SubCircuit <: AbstractQuantumSystem
     parent::Circuit
-    mode_indices::Vector{Int}       # indices into parent's active_modes list
+    mode_indices::Vector{Int}       # actual variable indices (scqubits convention)
     _hamiltonian::QuantumObject
     _dim::Int                       # truncated_dim
     _eigvals::Vector{Float64}
@@ -71,7 +71,7 @@ end
 """Internal result returned by `_process_node`."""
 struct LevelResult
     subcircuit::SubCircuit
-    all_mode_indices::Vector{Int}                              # active-mode indices in this subtree
+    all_mode_indices::Vector{Int}                              # actual variable indices in this subtree
     dressed_n_ops::Dict{Int, SparseMatrixCSC{ComplexF64, Int}}   # ai => dressed n̂
     dressed_phi_ops::Dict{Int, SparseMatrixCSC{ComplexF64, Int}} # ai => dressed φ̂
     dressed_exp_builders::Dict{Int, Function}                    # ai => (c -> dressed exp(icθ))
@@ -119,6 +119,7 @@ struct HierarchyContext
     L_inv_transformed::Matrix{Float64}
     T_inv::Matrix{Float64}
     n_nodes::Int
+    var_to_pos::Dict{Int,Int}           # variable index → position in active_modes/dims/mode_ops
 end
 
 # ── Leaf diagonalization ─────────────────────────────────────────────────────
@@ -126,36 +127,63 @@ end
 function _process_leaf(ctx::HierarchyContext, leaf::HierarchyLeaf, trunc_dim::Int)
     circ = ctx.circ
     sc = circ.symbolic_circuit
-    group = leaf.mode_indices
-    sub_dims = [ctx.dims[ai] for ai in group]
+    vc = circ.var_categories
+    group = leaf.mode_indices           # actual variable indices (scqubits convention)
+    sub_dims = [ctx.dims[ctx.var_to_pos[vi]] for vi in group]
     sub_total = prod(sub_dims)
+
+    # ── Build ng-shifted n operators for periodic modes ────────────────────
+    shifted_n_ops = Dict{Int, SparseMatrixCSC{ComplexF64, Int}}()
+    for vi in group
+        pos = ctx.var_to_pos[vi]
+        n_op = ctx.mode_ops[pos].n_op
+        if vi in vc.periodic
+            ng = get(circ.offset_charge_values, vi, 0.0)
+            if abs(ng) > 1e-15
+                n_op = n_op - ng * _eye_like(n_op)
+            end
+        end
+        shifted_n_ops[vi] = n_op
+    end
 
     # ── Build sub-Hamiltonian ──────────────────────────────────────────────
     H_sub = spzeros(ComplexF64, sub_total, sub_total)
 
-    # Charging energy (intra-group)
-    for (li, ai) in enumerate(group)
-        mi = ctx.active_modes[ai]
-        for (lj, aj) in enumerate(group)
-            mj = ctx.active_modes[aj]
-            ec_val = ctx.ec_transformed[mi, mj]
+    # Charging energy (intra-group): 4*EC*(n_i - ng_i)*(n_j - ng_j)
+    for (li, vi) in enumerate(group)
+        for (lj, vj) in enumerate(group)
+            ec_val = ctx.ec_transformed[vi, vj]
             abs(ec_val) < 1e-15 && continue
-            ni_full = _identity_wrap_sparse(ctx.mode_ops[ai].n_op, li, sub_dims)
-            nj_full = _identity_wrap_sparse(ctx.mode_ops[aj].n_op, lj, sub_dims)
+            ni_full = _identity_wrap_sparse(shifted_n_ops[vi], li, sub_dims)
+            nj_full = _identity_wrap_sparse(shifted_n_ops[vj], lj, sub_dims)
             H_sub .+= 4 * ec_val * ni_full * nj_full
         end
     end
 
-    # Inductive energy (intra-group)
-    for (li, ai) in enumerate(group)
-        mi = ctx.active_modes[ai]
-        for (lj, aj) in enumerate(group)
-            mj = ctx.active_modes[aj]
-            l_val = ctx.L_inv_transformed[mi, mj]
+    # Inductive energy (intra-group): quadratic part
+    for (li, vi) in enumerate(group)
+        for (lj, vj) in enumerate(group)
+            l_val = ctx.L_inv_transformed[vi, vj]
             abs(l_val) < 1e-15 && continue
-            phi_i = _identity_wrap_sparse(ctx.mode_ops[ai].phi_op, li, sub_dims)
-            phi_j = _identity_wrap_sparse(ctx.mode_ops[aj].phi_op, lj, sub_dims)
+            phi_i = _identity_wrap_sparse(ctx.mode_ops[ctx.var_to_pos[vi]].phi_op, li, sub_dims)
+            phi_j = _identity_wrap_sparse(ctx.mode_ops[ctx.var_to_pos[vj]].phi_op, lj, sub_dims)
             H_sub .+= 0.5 * l_val * phi_i * phi_j
+        end
+    end
+
+    # Inductive external flux: linear terms for modes in this leaf
+    cg = sc.graph
+    for (bi, b) in enumerate(cg.branches)
+        b.branch_type == L_branch || continue
+        el = _get_branch_param(circ, bi, :EL)
+        phi_ext_val = _eval_branch_ext_flux(circ, bi)
+        abs(phi_ext_val) < 1e-15 && continue
+        for (li, vi) in enumerate(group)
+            w_k = _branch_mode_coeff(b, ctx.T_inv, vi)
+            abs(w_k) < 1e-15 && continue
+            pos = ctx.var_to_pos[vi]
+            phi_op = _identity_wrap_sparse(ctx.mode_ops[pos].phi_op, li, sub_dims)
+            H_sub .+= el * phi_ext_val * w_k * phi_op
         end
     end
 
@@ -165,17 +193,18 @@ function _process_leaf(ctx::HierarchyContext, leaf::HierarchyLeaf, trunc_dim::In
         ej_val = ej_current_vals[jj_idx]
         phase_coeffs, ext_phase = _extract_phase_info(circ, phase_sym, ctx.T_inv,
                                                        ctx.n_nodes, ctx.active_modes)
-        involved_modes = collect(keys(phase_coeffs))
+        # Re-key from active-mode position to variable index
+        var_coeffs = Dict(ctx.active_modes[ai] => c for (ai, c) in phase_coeffs)
+        involved_modes = collect(keys(var_coeffs))
         if all(m -> m in group, involved_modes)
             local_coeffs = Dict{Int,Float64}()
-            for (ai, c) in phase_coeffs
-                li = findfirst(==(ai), group)
+            for (vi, c) in var_coeffs
+                li = findfirst(==(vi), group)
                 local_coeffs[li] = c
             end
-            local_mode_ops = [ctx.mode_ops[ai] for ai in group]
+            local_mode_ops = [ctx.mode_ops[ctx.var_to_pos[vi]] for vi in group]
             cos_op = _build_cos_operator(circ, local_coeffs, ext_phase,
-                                          [ctx.active_modes[ai] for ai in group],
-                                          sub_dims, local_mode_ops)
+                                          group, sub_dims, local_mode_ops)
             H_sub .-= ej_val * cos_op
         end
     end
@@ -191,22 +220,23 @@ function _process_leaf(ctx::HierarchyContext, leaf::HierarchyLeaf, trunc_dim::In
     H_diag = QuantumObject(spdiagm(0 => ComplexF64.(evals)))
     subcircuit = SubCircuit(circ, group, H_diag, n_states, evals, evecs)
 
-    # ── Dressed operators ──────────────────────────────────────────────────
+    # ── Dressed operators (ng-shifted n̂ for correct cross-coupling) ───────
     dressed_n = Dict{Int, SparseMatrixCSC{ComplexF64, Int}}()
     dressed_phi = Dict{Int, SparseMatrixCSC{ComplexF64, Int}}()
     dressed_exp = Dict{Int, Function}()
 
-    for (li, ai) in enumerate(group)
-        n_full = _identity_wrap_sparse(ctx.mode_ops[ai].n_op, li, sub_dims)
-        phi_full = _identity_wrap_sparse(ctx.mode_ops[ai].phi_op, li, sub_dims)
-        dressed_n[ai] = sparse(evecs' * n_full * evecs)
-        dressed_phi[ai] = sparse(evecs' * phi_full * evecs)
+    for (li, vi) in enumerate(group)
+        pos = ctx.var_to_pos[vi]
+        n_full = _identity_wrap_sparse(shifted_n_ops[vi], li, sub_dims)
+        phi_full = _identity_wrap_sparse(ctx.mode_ops[pos].phi_op, li, sub_dims)
+        dressed_n[vi] = sparse(evecs' * n_full * evecs)
+        dressed_phi[vi] = sparse(evecs' * phi_full * evecs)
 
         # Closure: build dressed exp(icθ) for arbitrary coefficient c
-        let mop = ctx.mode_ops[ai], mi = ctx.active_modes[ai],
+        let mop = ctx.mode_ops[pos], _vi = vi,
             _li = li, _sub_dims = sub_dims, _evecs = evecs
-            dressed_exp[ai] = function(c)
-                bare_exp = _build_single_mode_exp(circ, mop, mi, c)
+            dressed_exp[vi] = function(c)
+                bare_exp = _build_single_mode_exp(circ, mop, _vi, c)
                 exp_full = _identity_wrap_sparse(bare_exp, _li, _sub_dims)
                 return sparse(_evecs' * exp_full * _evecs)
             end
@@ -247,16 +277,14 @@ function _process_intermediate_group(ctx::HierarchyContext,
     # Cross-child capacitive couplings (factor 2 for symmetric sum)
     for cA in 1:n_children
         for cB in (cA+1):n_children
-            for aiA in child_results[cA].all_mode_indices
-                miA = ctx.active_modes[aiA]
-                for aiB in child_results[cB].all_mode_indices
-                    miB = ctx.active_modes[aiB]
-                    ec_val = ctx.ec_transformed[miA, miB]
+            for viA in child_results[cA].all_mode_indices
+                for viB in child_results[cB].all_mode_indices
+                    ec_val = ctx.ec_transformed[viA, viB]
                     abs(ec_val) < 1e-15 && continue
 
-                    nA = _identity_wrap_sparse(child_results[cA].dressed_n_ops[aiA],
+                    nA = _identity_wrap_sparse(child_results[cA].dressed_n_ops[viA],
                                                cA, child_dims)
-                    nB = _identity_wrap_sparse(child_results[cB].dressed_n_ops[aiB],
+                    nB = _identity_wrap_sparse(child_results[cB].dressed_n_ops[viB],
                                                cB, child_dims)
                     H_combined .+= 2 * 4 * ec_val * nA * nB
                 end
@@ -267,16 +295,14 @@ function _process_intermediate_group(ctx::HierarchyContext,
     # Cross-child inductive couplings (factor 2 for symmetric sum)
     for cA in 1:n_children
         for cB in (cA+1):n_children
-            for aiA in child_results[cA].all_mode_indices
-                miA = ctx.active_modes[aiA]
-                for aiB in child_results[cB].all_mode_indices
-                    miB = ctx.active_modes[aiB]
-                    l_val = ctx.L_inv_transformed[miA, miB]
+            for viA in child_results[cA].all_mode_indices
+                for viB in child_results[cB].all_mode_indices
+                    l_val = ctx.L_inv_transformed[viA, viB]
                     abs(l_val) < 1e-15 && continue
 
-                    phiA = _identity_wrap_sparse(child_results[cA].dressed_phi_ops[aiA],
+                    phiA = _identity_wrap_sparse(child_results[cA].dressed_phi_ops[viA],
                                                   cA, child_dims)
-                    phiB = _identity_wrap_sparse(child_results[cB].dressed_phi_ops[aiB],
+                    phiB = _identity_wrap_sparse(child_results[cB].dressed_phi_ops[viB],
                                                   cB, child_dims)
                     H_combined .+= 2 * 0.5 * l_val * phiA * phiB
                 end
@@ -292,16 +318,18 @@ function _process_intermediate_group(ctx::HierarchyContext,
         ej_val = ej_current_vals[jj_idx]
         phase_coeffs, ext_phase = _extract_phase_info(ctx.circ, phase_sym, ctx.T_inv,
                                                        ctx.n_nodes, ctx.active_modes)
+        # Re-key from active-mode position to variable index
+        var_coeffs = Dict(ctx.active_modes[ai] => c for (ai, c) in phase_coeffs)
         # Map modes to children
         children_involved = Dict{Int, Vector{Tuple{Int, Float64}}}()
-        for (ai, c) in phase_coeffs
-            ai in all_modes_here || continue
-            ci = findfirst(r -> ai in r.all_mode_indices, child_results)
+        for (vi, c) in var_coeffs
+            vi in all_modes_here || continue
+            ci = findfirst(r -> vi in r.all_mode_indices, child_results)
             ci === nothing && continue
             if !haskey(children_involved, ci)
                 children_involved[ci] = Tuple{Int, Float64}[]
             end
-            push!(children_involved[ci], (ai, c))
+            push!(children_involved[ci], (vi, c))
         end
 
         # Skip if intra-child (already handled) or involves modes outside this group
@@ -315,8 +343,8 @@ function _process_intermediate_group(ctx::HierarchyContext,
                 dressed_exp_per_child[ci] = sparse(ComplexF64(1.0) * I, d, d)
             else
                 child_exp = sparse(ComplexF64(1.0) * I, d, d)
-                for (ai, c) in children_involved[ci]
-                    child_exp = child_exp * child_results[ci].dressed_exp_builders[ai](c)
+                for (vi, c) in children_involved[ci]
+                    child_exp = child_exp * child_results[ci].dressed_exp_builders[vi](c)
                 end
                 dressed_exp_per_child[ci] = child_exp
             end
@@ -344,15 +372,15 @@ function _process_intermediate_group(ctx::HierarchyContext,
     new_dressed_exp = Dict{Int, Function}()
 
     for (ci, r) in enumerate(child_results)
-        for ai in r.all_mode_indices
-            n_wrapped = _identity_wrap_sparse(r.dressed_n_ops[ai], ci, child_dims)
-            phi_wrapped = _identity_wrap_sparse(r.dressed_phi_ops[ai], ci, child_dims)
-            new_dressed_n[ai] = sparse(evecs' * n_wrapped * evecs)
-            new_dressed_phi[ai] = sparse(evecs' * phi_wrapped * evecs)
+        for vi in r.all_mode_indices
+            n_wrapped = _identity_wrap_sparse(r.dressed_n_ops[vi], ci, child_dims)
+            phi_wrapped = _identity_wrap_sparse(r.dressed_phi_ops[vi], ci, child_dims)
+            new_dressed_n[vi] = sparse(evecs' * n_wrapped * evecs)
+            new_dressed_phi[vi] = sparse(evecs' * phi_wrapped * evecs)
 
-            let old_builder = r.dressed_exp_builders[ai],
+            let old_builder = r.dressed_exp_builders[vi],
                 _ci = ci, _child_dims = child_dims, _evecs = evecs
-                new_dressed_exp[ai] = function(c)
+                new_dressed_exp[vi] = function(c)
                     old_exp = old_builder(c)
                     exp_wrapped = _identity_wrap_sparse(old_exp, _ci, _child_dims)
                     return sparse(_evecs' * exp_wrapped * _evecs)
@@ -399,7 +427,8 @@ hs = hierarchical_diag(circ;
     subsystem_trunc_dims = Dict(1=>10, 2=>10))
 ```
 
-Each `Vector{Int}` is a leaf group of mode indices (1-based into active modes).
+Each `Vector{Int}` is a leaf group of **actual variable indices** (scqubits
+convention), not positions in the active-modes array.
 `subsystem_trunc_dims::Dict{Int,Int}` maps group index → truncation dimension.
 
 # Nested hierarchy
@@ -450,10 +479,10 @@ function hierarchical_diag(circ::Circuit; system_hierarchy, subsystem_trunc_dims
 
     # ── Validate hierarchy ─────────────────────────────────────────────────
     all_modes = sort(_collect_modes(hier))
-    expected = collect(1:n_active)
+    expected = sort(active_modes)
     all_modes == expected ||
-        error("system_hierarchy must partition active modes 1:$n_active exactly. " *
-              "Got: $all_modes, expected: $expected")
+        error("system_hierarchy must partition active variable indices $expected exactly. " *
+              "Got: $all_modes")
 
     # ── Transformed matrices ───────────────────────────────────────────────
     C_numeric = _build_capacitance_matrix_numeric(circ)
@@ -466,8 +495,10 @@ function hierarchical_diag(circ::Circuit; system_hierarchy, subsystem_trunc_dims
     dims = Int[circ.cutoffs[m] for m in active_modes]
     mode_ops = _build_mode_operators(circ, active_modes, dims)
 
+    var_to_pos = Dict(mi => ai for (ai, mi) in enumerate(active_modes))
     ctx = HierarchyContext(circ, active_modes, dims, mode_ops,
-                           ec_transformed, L_inv_transformed, T_inv, n_nodes)
+                           ec_transformed, L_inv_transformed, T_inv, n_nodes,
+                           var_to_pos)
 
     # ── Process top-level children ─────────────────────────────────────────
     child_results = LevelResult[]
@@ -487,15 +518,13 @@ function hierarchical_diag(circ::Circuit; system_hierarchy, subsystem_trunc_dims
     # ── Cross-child capacitive couplings (factor 2 for symmetric sum) ──────
     for cA in 1:n_children
         for cB in (cA+1):n_children
-            for aiA in child_results[cA].all_mode_indices
-                miA = active_modes[aiA]
-                for aiB in child_results[cB].all_mode_indices
-                    miB = active_modes[aiB]
-                    ec_val = ec_transformed[miA, miB]
+            for viA in child_results[cA].all_mode_indices
+                for viB in child_results[cB].all_mode_indices
+                    ec_val = ec_transformed[viA, viB]
                     abs(ec_val) < 1e-15 && continue
 
-                    nA_qobj = QuantumObject(sparse(child_results[cA].dressed_n_ops[aiA]))
-                    nB_qobj = QuantumObject(sparse(child_results[cB].dressed_n_ops[aiB]))
+                    nA_qobj = QuantumObject(sparse(child_results[cA].dressed_n_ops[viA]))
+                    nB_qobj = QuantumObject(sparse(child_results[cB].dressed_n_ops[viB]))
                     scA = subcircuits[cA]
                     scB = subcircuits[cB]
 
@@ -510,15 +539,13 @@ function hierarchical_diag(circ::Circuit; system_hierarchy, subsystem_trunc_dims
     # ── Cross-child inductive couplings (factor 2 for symmetric sum) ───────
     for cA in 1:n_children
         for cB in (cA+1):n_children
-            for aiA in child_results[cA].all_mode_indices
-                miA = active_modes[aiA]
-                for aiB in child_results[cB].all_mode_indices
-                    miB = active_modes[aiB]
-                    l_val = L_inv_transformed[miA, miB]
+            for viA in child_results[cA].all_mode_indices
+                for viB in child_results[cB].all_mode_indices
+                    l_val = L_inv_transformed[viA, viB]
                     abs(l_val) < 1e-15 && continue
 
-                    phiA_qobj = QuantumObject(sparse(child_results[cA].dressed_phi_ops[aiA]))
-                    phiB_qobj = QuantumObject(sparse(child_results[cB].dressed_phi_ops[aiB]))
+                    phiA_qobj = QuantumObject(sparse(child_results[cA].dressed_phi_ops[viA]))
+                    phiB_qobj = QuantumObject(sparse(child_results[cB].dressed_phi_ops[viB]))
                     scA = subcircuits[cA]
                     scB = subcircuits[cB]
 
@@ -536,15 +563,17 @@ function hierarchical_diag(circ::Circuit; system_hierarchy, subsystem_trunc_dims
         ej_val = ej_current_vals[jj_idx]
         phase_coeffs, ext_phase = _extract_phase_info(circ, phase_sym, T_inv,
                                                        n_nodes, active_modes)
+        # Re-key from active-mode position to variable index
+        var_coeffs = Dict(active_modes[ai] => c for (ai, c) in phase_coeffs)
         # Map modes to top-level children
         children_involved = Dict{Int, Vector{Tuple{Int, Float64}}}()
-        for (ai, c) in phase_coeffs
-            ci = findfirst(r -> ai in r.all_mode_indices, child_results)
+        for (vi, c) in var_coeffs
+            ci = findfirst(r -> vi in r.all_mode_indices, child_results)
             ci === nothing && continue
             if !haskey(children_involved, ci)
                 children_involved[ci] = Tuple{Int, Float64}[]
             end
-            push!(children_involved[ci], (ai, c))
+            push!(children_involved[ci], (vi, c))
         end
 
         length(children_involved) <= 1 && continue
@@ -557,8 +586,8 @@ function hierarchical_diag(circ::Circuit; system_hierarchy, subsystem_trunc_dims
                 dressed_exp_per_child[ci] = sparse(ComplexF64(1.0) * I, d, d)
             else
                 child_exp = sparse(ComplexF64(1.0) * I, d, d)
-                for (ai, c) in children_involved[ci]
-                    child_exp = child_exp * child_results[ci].dressed_exp_builders[ai](c)
+                for (vi, c) in children_involved[ci]
+                    child_exp = child_exp * child_results[ci].dressed_exp_builders[vi](c)
                 end
                 dressed_exp_per_child[ci] = child_exp
             end
@@ -569,6 +598,19 @@ function hierarchical_diag(circ::Circuit; system_hierarchy, subsystem_trunc_dims
 
         add_operator!(hs, QuantumObject(sparse(-ej_val * cos_op_full),
                                         dims=Tuple(dims_trunc)))
+    end
+
+    # ── Inductive external flux: constant energy shift ─────────────────────
+    cg = sc.graph
+    total_hs_dim = prod(dims_trunc)
+    for (bi, b) in enumerate(cg.branches)
+        b.branch_type == L_branch || continue
+        el = _get_branch_param(circ, bi, :EL)
+        phi_ext_val = _eval_branch_ext_flux(circ, bi)
+        abs(phi_ext_val) < 1e-15 && continue
+        shift = (el / 2) * phi_ext_val^2
+        I_full = sparse(ComplexF64(1.0) * I, total_hs_dim, total_hs_dim)
+        add_operator!(hs, QuantumObject(shift * I_full, dims=Tuple(dims_trunc)))
     end
 
     return hs

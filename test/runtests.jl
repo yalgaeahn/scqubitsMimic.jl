@@ -774,6 +774,57 @@ branches:
         @test evals_hier ≈ evals_full atol=1e-6
     end
 
+    @testset "Hierarchical diag: Yan-style coupler flux sweep" begin
+        desc = """
+branches:
+  - [JJ, 0, 1, EJ=4.5, EC=0.1]
+  - [JJ, 1, 0, EJ=10.5, EC=0.1]
+  - [C, 1, 0, EC=0.2]
+  - [C, 1, 2, EC=5.0]
+  - [JJ, 0, 2, EJ=30.0, EC=0.1]
+  - [JJ, 2, 0, EJ=20.0, EC=0.1]
+  - [C, 2, 0, EC=0.1]
+  - [C, 2, 3, EC=5.0]
+  - [JJ, 0, 3, EJ=4.6, EC=0.1]
+  - [JJ, 3, 0, EJ=10.0, EC=0.1]
+  - [C, 3, 0, EC=0.2]
+"""
+        flux_vals = [-π, 0.0, π]
+
+        qb1_w01 = Float64[]
+        cplr_w01 = Float64[]
+        qb2_w01 = Float64[]
+
+        for phi2 in flux_vals
+            circ = Circuit(desc; ncut=6)
+            set_param!(circ, :Φ1, 0.0)
+            set_param!(circ, :Φ2, phi2)
+            set_param!(circ, :Φ3, 0.0)
+
+            hs = hierarchical_diag(circ;
+                system_hierarchy=[[1], [2], [3]],
+                subsystem_trunc_dims=Dict(1=>3, 2=>3, 3=>3))
+
+            @test length(hs.subsystems) == 3
+            @test all(sub -> sub isa SubCircuit, hs.subsystems)
+
+            push!(qb1_w01, eigenvals(hs.subsystems[1]; evals_count=2)[2] -
+                            eigenvals(hs.subsystems[1]; evals_count=2)[1])
+            push!(cplr_w01, eigenvals(hs.subsystems[2]; evals_count=2)[2] -
+                             eigenvals(hs.subsystems[2]; evals_count=2)[1])
+            push!(qb2_w01, eigenvals(hs.subsystems[3]; evals_count=2)[2] -
+                            eigenvals(hs.subsystems[3]; evals_count=2)[1])
+        end
+
+        @test qb1_w01[1] ≈ qb1_w01[2] atol=1e-10
+        @test qb1_w01[2] ≈ qb1_w01[3] atol=1e-10
+        @test qb2_w01[1] ≈ qb2_w01[2] atol=1e-10
+        @test qb2_w01[2] ≈ qb2_w01[3] atol=1e-10
+        @test cplr_w01[2] > cplr_w01[1]
+        @test cplr_w01[2] > cplr_w01[3]
+        @test cplr_w01[1] ≈ cplr_w01[3] atol=1e-10
+    end
+
     @testset "Symbolic accessors" begin
         desc = """
 branches:
