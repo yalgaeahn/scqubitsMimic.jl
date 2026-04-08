@@ -288,6 +288,30 @@ function _build_inv_inductance_matrix_numeric(circ::Circuit)
     return L_inv
 end
 
+"""Evaluate the numerical external flux for a given branch from its symbolic allocation."""
+function _eval_branch_ext_flux(circ::Circuit, bi::Int)
+    sc = circ.symbolic_circuit
+    alloc = sc.branch_flux_allocations[bi]
+    subs = Dict{Num, Float64}()
+    for (fi, ef) in enumerate(sc.external_fluxes)
+        subs[ef] = fi <= length(circ.external_flux_values) ?
+                   circ.external_flux_values[fi] : 0.0
+    end
+    return Float64(Symbolics.value(Symbolics.substitute(alloc, subs)))
+end
+
+"""Coefficient of mode `mode_idx` in a branch's phase (φ_j - φ_i) after transformation."""
+function _branch_mode_coeff(b::Branch, T_inv::Matrix{Float64}, mode_idx::Int)
+    w = 0.0
+    if b.node_j != 0
+        w += T_inv[b.node_j, mode_idx]
+    end
+    if b.node_i != 0
+        w -= T_inv[b.node_i, mode_idx]
+    end
+    return w
+end
+
 """Return current EJ values for each Josephson term, respecting overrides.
 Order matches `sc.josephson_terms`."""
 function _get_josephson_ej_values(circ::Circuit)
@@ -386,7 +410,9 @@ function _build_numerical_hamiltonian(circ::Circuit)
         end
     end
 
-    # 2. Inductive energy: H_ind = (1/2) Σ L_inv_θ[i,j] * φ_i * φ_j
+    # 2. Inductive energy: (EL/2)(branch_flux + Φext)²
+    #    = (1/2) φ^T L_inv φ  +  EL·Φext·(φ_j - φ_i)  +  (EL/2)·Φext²
+    # Part 2a: quadratic (flux-independent) part via L_inv
     L_inv_float = _build_inv_inductance_matrix_numeric(circ)
     L_inv_transformed = T' * L_inv_float * T
 
@@ -399,6 +425,27 @@ function _build_numerical_hamiltonian(circ::Circuit)
             phi_j = _identity_wrap_sparse(mode_ops[aj].phi_op, aj, dims)
             H .+= 0.5 * l_val * phi_i * phi_j
         end
+    end
+
+    # Part 2b: linear and constant terms from inductive external flux
+    cg = sc.graph
+    for (bi, b) in enumerate(cg.branches)
+        b.branch_type == L_branch || continue
+        el = _get_branch_param(circ, bi, :EL)
+        phi_ext_val = _eval_branch_ext_flux(circ, bi)
+        abs(phi_ext_val) < 1e-15 && continue
+
+        # Linear term: EL * Φext * (φ_j - φ_i) in mode-transformed space
+        for (ai, mi) in enumerate(active_modes)
+            w_k = _branch_mode_coeff(b, T_inv, mi)
+            abs(w_k) < 1e-15 && continue
+            phi_op = _identity_wrap_sparse(mode_ops[ai].phi_op, ai, dims)
+            H .+= el * phi_ext_val * w_k * phi_op
+        end
+
+        # Constant term: (EL/2) * Φext²
+        I_op = sparse(ComplexF64(1.0) * I, total_dim, total_dim)
+        H .+= (el / 2) * phi_ext_val^2 * I_op
     end
 
     # 3. Josephson terms: -EJ * cos(phase)

@@ -187,22 +187,24 @@ function transform_hamiltonian(sc::SymbolicCircuit, T::Matrix{Float64},
         H_charge += 4 * ec_transformed[i, j] * mode_charges[i] * mode_charges[j]
     end
 
-    # Inductive energy in mode basis
-    L_inv_float = Float64.(Symbolics.value.(sc.inv_inductance_matrix))
-    L_inv_transformed = T' * L_inv_float * T
+    # Inductive energy in mode basis: branch-level with external flux
+    # Substitute φ_i → Σ_j T_inv[i,j] θ_j into each inductor's branch flux
+    node_subs = Dict(sc.node_vars[i] => sum(T_inv[i, j] * mode_phases[j] for j in 1:n)
+                      for i in 1:n)
 
     H_inductive = Num(0)
-    for i in 1:n, j in 1:n
-        abs(L_inv_transformed[i, j]) < 1e-15 && continue
-        H_inductive += L_inv_transformed[i, j] * mode_phases[i] * mode_phases[j] / 2
+    for (bi, b) in enumerate(sc.graph.branches)
+        b.branch_type == L_branch || continue
+        el = b.parameters[:EL]
+        branch_flux_node = _branch_phase(b, sc.node_vars) + sc.branch_flux_allocations[bi]
+        branch_flux_mode = Symbolics.substitute(branch_flux_node, node_subs)
+        H_inductive += el / 2 * branch_flux_mode^2
     end
 
     # Josephson terms: substitute φ = T^{-1} θ
     H_josephson = Num(0)
     for (ej, phase_expr) in sc.josephson_terms
-        subs = Dict(sc.node_vars[i] => sum(T_inv[i, j] * mode_phases[j] for j in 1:n)
-                     for i in 1:n)
-        new_phase = Symbolics.substitute(phase_expr, subs)
+        new_phase = Symbolics.substitute(phase_expr, node_subs)
         H_josephson += -ej * cos(new_phase)
     end
 

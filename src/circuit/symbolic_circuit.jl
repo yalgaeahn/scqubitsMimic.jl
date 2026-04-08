@@ -92,17 +92,14 @@ function build_symbolic_circuit(cg::CircuitGraph)
     # Josephson terms: use branch flux allocations (no loop search)
     jj_terms = _build_josephson_terms(cg, node_vars, branch_flux_alloc)
 
-    # Symbolic Hamiltonian: H = (1/2) Q^T C⁻¹ Q + (1/2) φ^T L⁻¹ φ - Σ EJ cos(...)
+    # Symbolic Hamiltonian: H = (1/2) Q^T C⁻¹ Q + Σ (EL/2)(branch_flux)² - Σ EJ cos(...)
     charge_vars = [Symbolics.variable(:n, i) for i in 1:n]
 
     H_charge = sum(4 * EC_mat[i, j] * charge_vars[i] * charge_vars[j]
                    for i in 1:n, j in 1:n)
 
-    H_inductive = Num(0)
-    if !iszero(L_inv)
-        H_inductive = sum(L_inv[i, j] * node_vars[i] * node_vars[j] / 2
-                          for i in 1:n, j in 1:n if !iszero(L_inv[i, j]))
-    end
+    # Inductive energy: branch-level with external flux
+    H_inductive = _build_inductive_terms(cg, node_vars, branch_flux_alloc)
 
     H_josephson = sum(-ej * cos(phase) for (ej, phase) in jj_terms; init=Num(0))
 
@@ -191,6 +188,28 @@ function _build_branch_flux_allocations(cg::CircuitGraph,
         alloc[ci] = ext_fluxes[k]
     end
     return alloc
+end
+
+# ── Inductive terms ──────────────────────────────────────────────────────────
+
+"""
+    _build_inductive_terms(cg, node_vars, branch_flux_alloc)
+
+Build inductive energy as a branch-level sum: `Σ (EL/2) * (φ_j - φ_i + Φext)²`.
+This correctly incorporates external flux into inductor branches, unlike the
+node-basis quadratic form `(1/2) φ^T L_inv φ` which only captures the
+flux-independent part.
+"""
+function _build_inductive_terms(cg::CircuitGraph, node_vars::Vector{Num},
+                                 branch_flux_alloc::Vector{Num})
+    H = Num(0)
+    for (bi, b) in enumerate(cg.branches)
+        b.branch_type == L_branch || continue
+        el = b.parameters[:EL]
+        branch_flux = _branch_phase(b, node_vars) + branch_flux_alloc[bi]
+        H += el / 2 * branch_flux^2
+    end
+    return H
 end
 
 # ── Josephson terms ──────────────────────────────────────────────────────────
