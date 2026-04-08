@@ -20,7 +20,16 @@ Each field contains 1-based indices into the transformed variable vector.
 - `periodic`: modes with compact (2π-periodic) phase variable — quantized in charge basis
 - `extended`: non-compact modes — quantized in HO or discretized basis
 - `free`: decoupled modes with conserved charge — eliminated
-- `frozen`: modes determined by equilibrium conditions — substituted out
+- `frozen`: nodes connected only to capacitors (no JJ, no L) — eliminated from Hilbert space
+
+# Frozen mode handling
+Frozen nodes have no potential energy (no JJ or L connections). Their only
+effect is on the charging energy of active modes, which is correctly accounted
+for via the full capacitance matrix inverse (equivalent to Schur complement).
+
+Note: Python scqubits also supports "freezing out" high-frequency modes that
+do have potential energy but are effectively in their ground state. This
+advanced optimization is not yet implemented here.
 """
 struct VarCategories
     periodic::Vector{Int}

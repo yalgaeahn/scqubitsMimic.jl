@@ -68,7 +68,8 @@ export Branch, CircuitGraph, parse_circuit
 export find_spanning_tree, find_closure_branches, find_fundamental_loops
 export SymbolicCircuit, build_symbolic_circuit
 export compute_variable_transformation, VarCategories
-export Circuit, set_external_flux!, set_offset_charge!, invalidate_cache!
+export Circuit, set_external_flux!, set_offset_charge!, invalidate_cache!,
+       list_branch_params
 export sym_hamiltonian, sym_hamiltonian_node, variable_transformation,
        external_fluxes, offset_charges
 export SubCircuit, hierarchical_diag

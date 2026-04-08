@@ -44,6 +44,10 @@ mutable struct Circuit <: AbstractQuantumSystem
     external_flux_values::Vector{Float64}
     offset_charge_values::Vector{Float64}
 
+    # Branch parameter overrides for parameter sweeps (EJ, EL, EC)
+    # Key: (branch_index, param_name) => override_value
+    branch_param_overrides::Dict{Tuple{Int, Symbol}, Float64}
+
     # Cache
     _hamiltonian_cache::Union{Nothing, QuantumObject}
 end
@@ -82,9 +86,6 @@ function Circuit(description::String;
         phi_ranges[i] = phi_range
     end
 
-    # Compute oscillator lengths for harmonic basis
-    osc_lengths = _compute_osc_lengths(sc, T, vc)
-
     # External fluxes: default to 0
     n_ext = length(sc.external_fluxes)
     ext_vals = length(external_fluxes) == n_ext ? external_fluxes : zeros(n_ext)
@@ -93,9 +94,15 @@ function Circuit(description::String;
     n_ng = length(sc.offset_charges)
     ng_vals = length(offset_charges) == n_ng ? offset_charges : zeros(n_ng)
 
-    return Circuit(sc, T, vc, H_mode,
-                   cutoffs, ext_basis, phi_ranges, osc_lengths,
-                   ext_vals, ng_vals, nothing)
+    circ = Circuit(sc, T, vc, H_mode,
+                   cutoffs, ext_basis, phi_ranges, Dict{Int, Float64}(),
+                   ext_vals, ng_vals,
+                   Dict{Tuple{Int, Symbol}, Float64}(), nothing)
+
+    # Compute oscillator lengths (needs the Circuit to read branch params)
+    circ.osc_lengths = _compute_osc_lengths(circ)
+
+    return circ
 end
 
 # ── AbstractQuantumSystem interface ──────────────────────────────────────────
@@ -116,6 +123,10 @@ end
 """Invalidate cached Hamiltonian (call after changing parameters)."""
 function invalidate_cache!(circ::Circuit)
     circ._hamiltonian_cache = nothing
+    # Recompute oscillator lengths if branch parameters have been overridden
+    if !isempty(circ.branch_param_overrides)
+        circ.osc_lengths = _compute_osc_lengths(circ)
+    end
 end
 
 # ── Symbolic accessors ──────────────────────────────────────────────────────
@@ -152,36 +163,156 @@ end
 # ── set_param! / get_param for parameter sweeps ─────────────────────────────
 
 function set_param!(circ::Circuit, param_name::Symbol, val)
+    s = string(param_name)
     if param_name == :flux || param_name == :Φext
-        # Shortcut: set first external flux (common for single-loop circuits)
         set_external_flux!(circ, 1, Float64(val))
-    elseif startswith(string(param_name), "Φext_")
-        idx = parse(Int, string(param_name)[6:end])
+    elseif startswith(s, "Φext_")
+        idx = parse(Int, s[6:end])
         set_external_flux!(circ, idx, Float64(val))
     elseif param_name == :ng
         set_offset_charge!(circ, 1, Float64(val))
-    elseif startswith(string(param_name), "ng_")
-        idx = parse(Int, string(param_name)[4:end])
+    elseif startswith(s, "ng_")
+        idx = parse(Int, s[4:end])
         set_offset_charge!(circ, idx, Float64(val))
+    elseif param_name in (:EJ, :EC, :EL)
+        _set_branch_param_first!(circ, param_name, Float64(val))
+        invalidate_cache!(circ)
+    elseif (m = match(r"^(EJ|EC|EL)_(\d+)$", s)) !== nothing
+        pname = Symbol(m.captures[1])
+        branch_idx = parse(Int, m.captures[2])
+        1 <= branch_idx <= length(circ.symbolic_circuit.graph.branches) ||
+            error("Branch index $branch_idx out of range")
+        circ.branch_param_overrides[(branch_idx, pname)] = Float64(val)
+        invalidate_cache!(circ)
     else
-        error("Circuit parameter sweep for :$param_name not yet supported. " *
-              "Use :flux, :Φext, :Φext_N, :ng, :ng_N")
+        error("Circuit parameter :$param_name not recognized. " *
+              "Use :flux, :Φext, :Φext_N, :ng, :ng_N, :EJ, :EC, :EL, :EJ_N, :EC_N, :EL_N")
     end
 end
 
 function get_param(circ::Circuit, param_name::Symbol)
+    s = string(param_name)
     if param_name == :flux || param_name == :Φext
         return circ.external_flux_values[1]
-    elseif startswith(string(param_name), "Φext_")
-        idx = parse(Int, string(param_name)[6:end])
+    elseif startswith(s, "Φext_")
+        idx = parse(Int, s[6:end])
         return circ.external_flux_values[idx]
     elseif param_name == :ng
         return circ.offset_charge_values[1]
-    elseif startswith(string(param_name), "ng_")
-        idx = parse(Int, string(param_name)[4:end])
+    elseif startswith(s, "ng_")
+        idx = parse(Int, s[4:end])
         return circ.offset_charge_values[idx]
+    elseif param_name in (:EJ, :EC, :EL)
+        return _get_branch_param_first(circ, param_name)
+    elseif (m = match(r"^(EJ|EC|EL)_(\d+)$", s)) !== nothing
+        pname = Symbol(m.captures[1])
+        branch_idx = parse(Int, m.captures[2])
+        return _get_branch_param(circ, branch_idx, pname)
     else
         error("Circuit parameter :$param_name not recognized")
+    end
+end
+
+"""Set parameter on the first branch that has it."""
+function _set_branch_param_first!(circ::Circuit, param::Symbol, val::Float64)
+    for (bi, b) in enumerate(circ.symbolic_circuit.graph.branches)
+        if haskey(b.parameters, param)
+            circ.branch_param_overrides[(bi, param)] = val
+            return
+        end
+    end
+    error("No branch in circuit has parameter :$param")
+end
+
+"""Get parameter from the first branch that has it."""
+function _get_branch_param_first(circ::Circuit, param::Symbol)
+    for (bi, b) in enumerate(circ.symbolic_circuit.graph.branches)
+        if haskey(b.parameters, param)
+            return _get_branch_param(circ, bi, param)
+        end
+    end
+    error("No branch in circuit has parameter :$param")
+end
+
+# ── Branch parameter helpers ────────────────────────────────────────────────
+
+"""Return effective value of `param` for branch `branch_idx`, using override if set."""
+function _get_branch_param(circ::Circuit, branch_idx::Int, param::Symbol)
+    key = (branch_idx, param)
+    return get(circ.branch_param_overrides, key,
+               circ.symbolic_circuit.graph.branches[branch_idx].parameters[param])
+end
+
+"""Build N×N capacitance matrix using current (overridden) branch parameters."""
+function _build_capacitance_matrix_numeric(circ::Circuit)
+    cg = circ.symbolic_circuit.graph
+    n = cg.num_nodes
+    C = zeros(Float64, n, n)
+
+    for (bi, b) in enumerate(cg.branches)
+        haskey(b.parameters, :EC) || continue
+        ec = _get_branch_param(circ, bi, :EC)
+        cap = 1.0 / (8.0 * ec)
+
+        i, j = b.node_i, b.node_j
+        if i != 0 && j != 0
+            C[i, i] += cap; C[j, j] += cap; C[i, j] -= cap; C[j, i] -= cap
+        elseif i == 0 && j != 0
+            C[j, j] += cap
+        elseif j == 0 && i != 0
+            C[i, i] += cap
+        end
+    end
+    return C
+end
+
+"""Build N×N inverse inductance matrix using current (overridden) branch parameters."""
+function _build_inv_inductance_matrix_numeric(circ::Circuit)
+    cg = circ.symbolic_circuit.graph
+    n = cg.num_nodes
+    L_inv = zeros(Float64, n, n)
+
+    for (bi, b) in enumerate(cg.branches)
+        b.branch_type == L_branch || continue
+        el = _get_branch_param(circ, bi, :EL)
+
+        i, j = b.node_i, b.node_j
+        if i != 0 && j != 0
+            L_inv[i, i] += el; L_inv[j, j] += el; L_inv[i, j] -= el; L_inv[j, i] -= el
+        elseif i == 0 && j != 0
+            L_inv[j, j] += el
+        elseif j == 0 && i != 0
+            L_inv[i, i] += el
+        end
+    end
+    return L_inv
+end
+
+"""Return current EJ values for each Josephson term, respecting overrides.
+Order matches `sc.josephson_terms`."""
+function _get_josephson_ej_values(circ::Circuit)
+    cg = circ.symbolic_circuit.graph
+    ej_vals = Float64[]
+    for (bi, b) in enumerate(cg.branches)
+        b.branch_type == JJ_branch || continue
+        push!(ej_vals, _get_branch_param(circ, bi, :EJ))
+    end
+    return ej_vals
+end
+
+"""
+    list_branch_params(circ::Circuit)
+
+Print all branch parameters with their current (effective) values.
+"""
+function list_branch_params(circ::Circuit)
+    cg = circ.symbolic_circuit.graph
+    for (bi, b) in enumerate(cg.branches)
+        type_str = string(b.branch_type)
+        for (pname, _) in b.parameters
+            val = _get_branch_param(circ, bi, pname)
+            println("  Branch $bi ($type_str, $(b.node_i)->$(b.node_j)): $pname = $val")
+        end
     end
 end
 
@@ -212,7 +343,8 @@ function _build_numerical_hamiltonian(circ::Circuit)
     mode_ops = _build_mode_operators(circ, active_modes, dims)
 
     # 1. Charging energy: H_charge = Σ 4*EC_θ[i,j] * (n_i - ng_i)(n_j - ng_j)
-    ec_float = Float64.(Symbolics.value.(sc.ec_matrix))
+    C_numeric = _build_capacitance_matrix_numeric(circ)
+    ec_float = inv(C_numeric) ./ 2
     ec_transformed = T_inv' * ec_float * T_inv
 
     H = spzeros(ComplexF64, total_dim, total_dim)
@@ -255,7 +387,7 @@ function _build_numerical_hamiltonian(circ::Circuit)
     end
 
     # 2. Inductive energy: H_ind = (1/2) Σ L_inv_θ[i,j] * φ_i * φ_j
-    L_inv_float = Float64.(Symbolics.value.(sc.inv_inductance_matrix))
+    L_inv_float = _build_inv_inductance_matrix_numeric(circ)
     L_inv_transformed = T' * L_inv_float * T
 
     for (ai, mi) in enumerate(active_modes)
@@ -270,8 +402,9 @@ function _build_numerical_hamiltonian(circ::Circuit)
     end
 
     # 3. Josephson terms: -EJ * cos(phase)
-    for (ej_sym, phase_sym) in sc.josephson_terms
-        ej_val = Float64(Symbolics.value(ej_sym))
+    ej_current_vals = _get_josephson_ej_values(circ)
+    for (jj_idx, (ej_sym, phase_sym)) in enumerate(sc.josephson_terms)
+        ej_val = ej_current_vals[jj_idx]
 
         # Extract mode coefficients and constant (ext flux) part from symbolic phase
         phase_coeffs, ext_phase = _extract_phase_info(circ, phase_sym, T_inv, n, active_modes)
@@ -478,13 +611,14 @@ function _eye_like(op::SparseMatrixCSC)
     return sparse(ComplexF64(1.0) * I, n, n)
 end
 
-function _compute_osc_lengths(sc::SymbolicCircuit, T::Matrix{Float64},
-                               vc::VarCategories)
+function _compute_osc_lengths(circ::Circuit)
+    T = circ.transformation_matrix
+    vc = circ.var_categories
     lengths = Dict{Int, Float64}()
-    n = sc.graph.num_nodes
 
-    ec_float = Float64.(Symbolics.value.(sc.ec_matrix))
-    L_inv_float = Float64.(Symbolics.value.(sc.inv_inductance_matrix))
+    C_numeric = _build_capacitance_matrix_numeric(circ)
+    ec_float = inv(C_numeric) ./ 2
+    L_inv_float = _build_inv_inductance_matrix_numeric(circ)
     T_inv = inv(T)
 
     ec_transformed = T_inv' * ec_float * T_inv

@@ -406,4 +406,164 @@ branches:
         @test 1 in vc.periodic
     end
 
+    # ── Branch parameter sweeps (GAP-PARAMSWEEP) ───────────────────────────
+
+    @testset "Branch parameter sweeps" begin
+        desc = """
+branches:
+  - [JJ, 0, 1, EJ=10.0, EC=0.3]
+  - [C, 0, 1, EC=0.5]
+"""
+        circ = Circuit(desc; ncut=20)
+        evals_orig = eigenvals(circ; evals_count=4)
+        w01_orig = evals_orig[2] - evals_orig[1]
+
+        # Test 1: EJ sweep — increasing EJ increases ω01
+        set_param!(circ, :EJ, 20.0)
+        @test get_param(circ, :EJ) == 20.0
+        evals_high = eigenvals(circ; evals_count=4)
+        w01_high = evals_high[2] - evals_high[1]
+        @test w01_high > w01_orig
+
+        # Test 2: restore original EJ
+        set_param!(circ, :EJ, 10.0)
+        evals_restored = eigenvals(circ; evals_count=4)
+        @test evals_restored ≈ evals_orig rtol=1e-10
+
+        # Test 3: indexed branch param (EJ on branch 1)
+        set_param!(circ, :EJ_1, 15.0)
+        @test get_param(circ, :EJ_1) == 15.0
+        w01_15 = eigenvals(circ; evals_count=4)[2] - eigenvals(circ; evals_count=4)[1]
+        @test w01_15 > w01_orig  # EJ=15 > EJ=10
+
+        # Test 4: EC sweep — increasing EC (decreasing capacitance) increases ω01
+        set_param!(circ, :EJ_1, 10.0)  # restore
+        set_param!(circ, :EC, 0.5)     # set EC on first branch with EC (JJ branch)
+        @test get_param(circ, :EC) == 0.5
+        w01_highec = eigenvals(circ; evals_count=4)[2] - eigenvals(circ; evals_count=4)[1]
+        # Higher EC means less capacitance, higher charging energy
+        # For transmon, ω01 ≈ √(8EJ·EC) - EC, so higher EC gives higher ω01
+        @test w01_highec > w01_orig
+
+        # Test 5: original graph is NOT mutated
+        @test circ.symbolic_circuit.graph.branches[1].parameters[:EJ] == 10.0
+
+        # Test 6: error on invalid branch index
+        @test_throws ErrorException set_param!(circ, :EJ_99, 5.0)
+
+        # Test 7: error on unrecognized parameter
+        @test_throws ErrorException set_param!(circ, :XYZ, 1.0)
+    end
+
+    @testset "Branch parameter sweep with get_spectrum_vs_paramvals" begin
+        desc = """
+branches:
+  - [JJ, 0, 1, EJ=10.0, EC=0.3]
+  - [C, 0, 1, EC=0.5]
+"""
+        circ = Circuit(desc; ncut=20)
+
+        # EJ sweep via get_spectrum_vs_paramvals
+        ej_vals = collect(range(5.0, 20.0, length=5))
+        sd = get_spectrum_vs_paramvals(circ, :EJ, ej_vals; evals_count=4)
+        @test size(sd.eigenvalues) == (5, 4)
+        # ω01 should increase with EJ (transmon regime)
+        w01s = sd.eigenvalues[:, 2] .- sd.eigenvalues[:, 1]
+        @test issorted(w01s)
+    end
+
+    @testset "Two-JJ SQUID indexed parameter" begin
+        desc = """
+branches:
+  - [JJ, 0, 1, EJ=10.0, EC=0.3]
+  - [JJ, 0, 1, EJ=10.0, EC=0.3]
+  - [C, 0, 1, EC=0.5]
+"""
+        circ = Circuit(desc; ncut=15)
+        evals_sym = eigenvals(circ; evals_count=4)
+
+        # Make asymmetric: EJ_1=15, EJ_2=5
+        set_param!(circ, :EJ_1, 15.0)
+        set_param!(circ, :EJ_2, 5.0)
+        @test get_param(circ, :EJ_1) == 15.0
+        @test get_param(circ, :EJ_2) == 5.0
+
+        # At zero flux, EJ_eff = EJ1 + EJ2 = 20 either way → same spectrum
+        evals_asym = eigenvals(circ; evals_count=4)
+        @test evals_asym ≈ evals_sym rtol=1e-10
+
+        # Increasing total EJ should increase ω01
+        set_param!(circ, :EJ_1, 20.0)  # total EJ = 25 now
+        w01_high = eigenvals(circ; evals_count=4)[2] - eigenvals(circ; evals_count=4)[1]
+        w01_sym = evals_sym[2] - evals_sym[1]
+        @test w01_high > w01_sym
+    end
+
+    # ── Frozen variable handling (GAP-FROZEN) ──────────────────────────────
+
+    @testset "Frozen variable handling" begin
+        # Frozen node with ground connection — capacitively shunts node 1
+        # Node 1: JJ to ground (periodic mode)
+        # Node 2: capacitively coupled to node 1 AND ground (frozen, but shunts)
+        desc_frozen = """
+branches:
+  - [JJ, 0, 1, EJ=10.0, EC=0.3]
+  - [C, 1, 2, EC=0.5]
+  - [C, 0, 2, EC=1.0]
+"""
+        circ_frozen = Circuit(desc_frozen; ncut=15)
+        T, vc = variable_transformation(circ_frozen)
+
+        # Node 2 should be classified as frozen
+        @test 2 in vc.frozen
+        @test 1 in vc.periodic
+        @test isempty(vc.extended)
+
+        # Should produce valid eigenvalues (only 1 active mode)
+        evals = eigenvals(circ_frozen; evals_count=4)
+        @test length(evals) == 4
+        @test issorted(evals)
+
+        # Compare with bare JJ circuit (no shunt from frozen node)
+        desc_bare = """
+branches:
+  - [JJ, 0, 1, EJ=10.0, EC=0.3]
+"""
+        circ_bare = Circuit(desc_bare; ncut=15)
+        evals_bare = eigenvals(circ_bare; evals_count=4)
+
+        # The frozen node with ground path adds shunt capacitance → lower ω01
+        w01_frozen = evals[2] - evals[1]
+        w01_bare = evals_bare[2] - evals_bare[1]
+        @test w01_frozen < w01_bare
+    end
+
+    @testset "Frozen node to ground" begin
+        desc = """
+branches:
+  - [JJ, 0, 1, EJ=10.0, EC=0.3]
+  - [C, 1, 2, EC=0.5]
+  - [C, 0, 2, EC=1.0]
+"""
+        circ = Circuit(desc; ncut=15)
+        T, vc = variable_transformation(circ)
+        @test 2 in vc.frozen
+        @test 1 in vc.periodic
+
+        evals = eigenvals(circ; evals_count=4)
+        @test length(evals) == 4
+        @test issorted(evals)
+    end
+
+    @testset "No frozen nodes in standard circuit" begin
+        desc = """
+branches:
+  - [JJ, 0, 1, EJ=10.0, EC=0.3]
+  - [C, 0, 1, EC=0.5]
+"""
+        circ = Circuit(desc; ncut=15)
+        _, vc = variable_transformation(circ)
+        @test isempty(vc.frozen)
+    end
+
 end

@@ -101,11 +101,12 @@ function hierarchical_diag(circ::Circuit;
             error("subsystem_trunc_dims must have an entry for group $k")
     end
 
-    # ── Transformed matrices ────────────────────────────────────────────────
-    ec_float = Float64.(Symbolics.value.(sc.ec_matrix))
+    # ── Transformed matrices (using current branch parameters) ──────────────
+    C_numeric = _build_capacitance_matrix_numeric(circ)
+    ec_float = inv(C_numeric) ./ 2
     ec_transformed = T_inv' * ec_float * T_inv
 
-    L_inv_float = Float64.(Symbolics.value.(sc.inv_inductance_matrix))
+    L_inv_float = _build_inv_inductance_matrix_numeric(circ)
     L_inv_transformed = T' * L_inv_float * T
 
     # ── Build sub-Hamiltonians and diagonalize ──────────────────────────────
@@ -153,8 +154,9 @@ function hierarchical_diag(circ::Circuit;
         end
 
         # Josephson terms (intra-group only)
-        for (ej_sym, phase_sym) in sc.josephson_terms
-            ej_val = Float64(Symbolics.value(ej_sym))
+        ej_current_vals = _get_josephson_ej_values(circ)
+        for (jj_idx, (ej_sym, phase_sym)) in enumerate(sc.josephson_terms)
+            ej_val = ej_current_vals[jj_idx]
             phase_coeffs, ext_phase = _extract_phase_info(circ, phase_sym, T_inv, n, active_modes)
 
             # Check if this Josephson term only involves modes in this group
