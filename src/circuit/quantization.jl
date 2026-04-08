@@ -42,7 +42,7 @@ mutable struct Circuit <: AbstractQuantumSystem
 
     # External flux and offset charge values
     external_flux_values::Vector{Float64}
-    offset_charge_values::Vector{Float64}
+    offset_charge_values::Dict{Int, Float64}
 
     # Branch parameter overrides for parameter sweeps (EJ, EL, EC)
     # Key: (branch_index, param_name) => override_value
@@ -90,9 +90,8 @@ function Circuit(description::String;
     n_ext = length(sc.external_fluxes)
     ext_vals = length(external_fluxes) == n_ext ? external_fluxes : zeros(n_ext)
 
-    # Offset charges: default to 0
-    n_ng = length(sc.offset_charges)
-    ng_vals = length(offset_charges) == n_ng ? offset_charges : zeros(n_ng)
+    # Offset charges: keyed by actual periodic mode index
+    ng_vals = _build_offset_charge_values(vc, offset_charges)
 
     circ = Circuit(sc, T, vc, H_mode,
                    cutoffs, ext_basis, phi_ranges, Dict{Int, Float64}(),
@@ -103,6 +102,15 @@ function Circuit(description::String;
     circ.osc_lengths = _compute_osc_lengths(circ)
 
     return circ
+end
+
+function _build_offset_charge_values(vc::VarCategories, offset_charges::Vector{Float64})
+    periodic_modes = vc.periodic
+    isempty(offset_charges) && return Dict{Int, Float64}(mode => 0.0 for mode in periodic_modes)
+    length(offset_charges) == length(periodic_modes) || throw(ArgumentError(
+        "Expected $(length(periodic_modes)) offset charges in periodic-mode order $(periodic_modes), got $(length(offset_charges))"
+    ))
+    return Dict(mode => Float64(offset_charges[idx]) for (idx, mode) in enumerate(periodic_modes))
 end
 
 # ── AbstractQuantumSystem interface ──────────────────────────────────────────
@@ -169,6 +177,186 @@ end
 """Return the symbolic offset charge variables."""
 offset_charges(circ::Circuit) = circ.symbolic_circuit.offset_charges
 
+"""
+    offset_charge_transformation(circ::Circuit)
+
+Return symbolic equations mapping periodic-mode offset charges `ng<i>` to node
+charge placeholders `q_n1, q_n2, ...` using `inv(Tᵀ)`.
+"""
+function offset_charge_transformation(circ::Circuit)
+    Tt_inv = inv(circ.transformation_matrix')
+    n = circ.symbolic_circuit.graph.num_nodes
+    node_charge_vars = Num[Num(Symbolics.variable(Symbol("q_n$(j)"))) for j in 1:n]
+
+    eqs = Any[]
+    for mode in circ.var_categories.periodic
+        lhs = Num(Symbolics.variable(Symbol("ng$(mode)")))
+        rhs = sum(Tt_inv[mode, j] * node_charge_vars[j] for j in 1:n; init=Num(0))
+        push!(eqs, lhs ~ rhs)
+    end
+
+    display(eqs)
+    return eqs
+end
+
+# ── Dynamic Circuit properties ───────────────────────────────────────────────
+
+function _cutoff_names(circ::Circuit)
+    vc = getfield(circ, :var_categories)
+    names = Symbol[]
+    append!(names, Symbol("cutoff_n_$(mode)") for mode in vc.periodic)
+    append!(names, Symbol("cutoff_ext_$(mode)") for mode in vc.extended)
+    return names
+end
+
+function _cutoff_property_info(circ::Circuit, name::Symbol)
+    s = string(name)
+    if (m = match(r"^cutoff_n_(\d+)$", s)) !== nothing
+        mode = parse(Int, m.captures[1])
+        mode in getfield(circ, :var_categories).periodic ||
+            throw(ArgumentError("cutoff_n_$mode is only defined for periodic modes $(getfield(circ, :var_categories).periodic)"))
+        return (:periodic, mode)
+    elseif (m = match(r"^cutoff_ext_(\d+)$", s)) !== nothing
+        mode = parse(Int, m.captures[1])
+        mode in getfield(circ, :var_categories).extended ||
+            throw(ArgumentError("cutoff_ext_$mode is only defined for extended modes $(getfield(circ, :var_categories).extended)"))
+        return (:extended, mode)
+    end
+    return nothing
+end
+
+function Base.getproperty(circ::Circuit, name::Symbol)
+    if name === :cutoff_names
+        return _cutoff_names(circ)
+    end
+    info = _cutoff_property_info(circ, name)
+    if info === nothing
+        return getfield(circ, name)
+    end
+
+    kind, mode = info
+    dim = getfield(circ, :cutoffs)[mode]
+    return kind === :periodic ? (dim - 1) ÷ 2 : dim
+end
+
+function Base.setproperty!(circ::Circuit, name::Symbol, value)
+    info = _cutoff_property_info(circ, name)
+    if info === nothing
+        return setfield!(circ, name, value)
+    end
+
+    kind, mode = info
+    value isa Integer || throw(ArgumentError("$(name) must be set to an integer"))
+    intval = Int(value)
+
+    if kind === :periodic
+        intval >= 0 || throw(ArgumentError("$(name) must be a nonnegative integer"))
+        getfield(circ, :cutoffs)[mode] = 2 * intval + 1
+    else
+        intval >= 1 || throw(ArgumentError("$(name) must be a positive integer"))
+        getfield(circ, :cutoffs)[mode] = intval
+    end
+
+    invalidate_cache!(circ)
+    return intval
+end
+
+function Base.propertynames(circ::Circuit, private::Bool=false)
+    names = collect(fieldnames(typeof(circ)))
+    push!(names, :cutoff_names)
+    append!(names, _cutoff_names(circ))
+    return Tuple(names)
+end
+
+# ── Symbolic Lagrangian ────────────────────────────────────────────────────────
+
+"""
+    sym_lagrangian(circ::Circuit; vars_type::Symbol=:node)
+
+Return the symbolic Lagrangian of the circuit as a `Symbolics.Num` expression.
+
+# Keyword arguments
+- `vars_type=:node`: Lagrangian in node flux variables φᵢ, φ̇ᵢ
+- `vars_type=:new`: Lagrangian in transformed mode variables θᵢ, θ̇ᵢ
+
+The Lagrangian is L = T - V where T is the capacitive kinetic energy
+and V contains inductive and Josephson potential terms.
+"""
+function sym_lagrangian(circ::Circuit; vars_type::Symbol=:node)
+    vars_type in (:node, :new) || throw(ArgumentError(
+        "vars_type must be :node or :new, got :$vars_type"))
+
+    sc = circ.symbolic_circuit
+    n = sc.graph.num_nodes
+    cg = sc.graph
+
+    if vars_type == :node
+        return _sym_lagrangian_node(sc, cg, n)
+    else
+        return _sym_lagrangian_new(sc, cg, n, circ.transformation_matrix)
+    end
+end
+
+function _sym_lagrangian_node(sc::SymbolicCircuit, cg::CircuitGraph, n::Int)
+    # Kinetic energy: T = (1/2) φ̇ᵀ C φ̇
+    kinetic = Num(0)
+    for i in 1:n, j in 1:n
+        kinetic += sc.capacitance_matrix[i, j] * sc.node_dot_vars[i] * sc.node_dot_vars[j]
+    end
+    kinetic = kinetic / 2
+
+    # Inductive potential: Σ (EL/2)(branch_flux + Φext)²
+    V_inductive = _build_inductive_terms(cg, sc.node_vars, sc.branch_flux_allocations)
+
+    # Josephson potential: Σ -EJ cos(phase + Φext)
+    V_JJ = sum(-ej * cos(phase) for (ej, phase) in sc.josephson_terms; init=Num(0))
+
+    return Symbolics.simplify(kinetic - V_inductive - V_JJ)
+end
+
+function _sym_lagrangian_new(sc::SymbolicCircuit, cg::CircuitGraph, n::Int,
+                              T::Matrix{Float64})
+    T_inv = inv(T)
+
+    # Mode variables
+    θ_vars = [Symbolics.variable(:θ, i) for i in 1:n]
+    θ̇_vars = [Symbolics.variable(:θ̇, i) for i in 1:n]
+
+    # Kinetic energy: T = (1/2) θ̇ᵀ Cθ θ̇  where Cθ = T⁻ᵀ C T⁻¹
+    C_float = Float64.(Symbolics.value.(sc.capacitance_matrix))
+    C_transformed = T_inv' * C_float * T_inv
+
+    kinetic = Num(0)
+    for i in 1:n, j in 1:n
+        abs(C_transformed[i, j]) < 1e-15 && continue
+        kinetic += C_transformed[i, j] * θ̇_vars[i] * θ̇_vars[j]
+    end
+    kinetic = kinetic / 2
+
+    # Substitution map: φᵢ → Σⱼ T⁻¹[i,j] θⱼ
+    node_subs = Dict(sc.node_vars[i] => sum(T_inv[i, j] * θ_vars[j] for j in 1:n)
+                      for i in 1:n)
+
+    # Inductive potential in mode basis
+    V_inductive = Num(0)
+    for (bi, b) in enumerate(cg.branches)
+        b.branch_type == L_branch || continue
+        el = b.parameters[:EL]
+        branch_flux_node = _branch_phase(b, sc.node_vars) + sc.branch_flux_allocations[bi]
+        branch_flux_mode = Symbolics.substitute(branch_flux_node, node_subs)
+        V_inductive += el / 2 * branch_flux_mode^2
+    end
+
+    # Josephson potential in mode basis
+    V_JJ = Num(0)
+    for (ej, phase_expr) in sc.josephson_terms
+        new_phase = Symbolics.substitute(phase_expr, node_subs)
+        V_JJ += -ej * cos(new_phase)
+    end
+
+    return Symbolics.simplify(kinetic - V_inductive - V_JJ)
+end
+
 # ── Parameter setters ────────────────────────────────────────────────────────
 
 """Set external flux value. `index` is 1-based."""
@@ -177,8 +365,10 @@ function set_external_flux!(circ::Circuit, index::Int, value::Float64)
     invalidate_cache!(circ)
 end
 
-"""Set offset charge value for mode `index`."""
+"""Set offset charge value for periodic mode `index`."""
 function set_offset_charge!(circ::Circuit, index::Int, value::Float64)
+    index in circ.var_categories.periodic ||
+        throw(ArgumentError("Offset charge ng$index is only defined for periodic modes $(circ.var_categories.periodic)"))
     circ.offset_charge_values[index] = value
     invalidate_cache!(circ)
 end
@@ -200,8 +390,8 @@ function _circuit_charge_index(circ::Circuit, param_name::Symbol)
     m = match(r"^ng(\d+)$", s)
     m === nothing && return nothing
     idx = parse(Int, m.captures[1])
-    1 <= idx <= length(circ.offset_charge_values) ||
-        error("Offset charge index $idx out of range for circuit with $(length(circ.offset_charge_values)) charge parameters")
+    idx in circ.var_categories.periodic ||
+        error("Offset charge ng$idx is only defined for periodic modes $(circ.var_categories.periodic)")
     return idx
 end
 
@@ -231,7 +421,7 @@ function get_param(circ::Circuit, param_name::Symbol)
     if (idx = _circuit_flux_index(circ, param_name)) !== nothing
         return circ.external_flux_values[idx]
     elseif (idx = _circuit_charge_index(circ, param_name)) !== nothing
-        return circ.offset_charge_values[idx]
+        return get(circ.offset_charge_values, idx, 0.0)
     elseif param_name in (:EJ, :EC, :EL)
         return _get_branch_param_first(circ, param_name)
     elseif (m = match(r"^(EJ|EC|EL)_(\d+)$", string(param_name))) !== nothing
@@ -414,23 +604,17 @@ function _build_numerical_hamiltonian(circ::Circuit)
 
             # Apply offset charges for periodic variables
             if mi in vc.periodic
-                idx_p = findfirst(==(mi), vc.periodic)
-                if idx_p !== nothing && idx_p <= length(circ.offset_charge_values)
-                    ng = circ.offset_charge_values[idx_p]
-                    if abs(ng) > 1e-15
-                        I_i = _eye_like(ni_op)
-                        ni_op = ni_op - ng * I_i
-                    end
+                ng = get(circ.offset_charge_values, mi, 0.0)
+                if abs(ng) > 1e-15
+                    I_i = _eye_like(ni_op)
+                    ni_op = ni_op - ng * I_i
                 end
             end
             if mj in vc.periodic
-                idx_p = findfirst(==(mj), vc.periodic)
-                if idx_p !== nothing && idx_p <= length(circ.offset_charge_values)
-                    ng = circ.offset_charge_values[idx_p]
-                    if abs(ng) > 1e-15
-                        I_j = _eye_like(nj_op)
-                        nj_op = nj_op - ng * I_j
-                    end
+                ng = get(circ.offset_charge_values, mj, 0.0)
+                if abs(ng) > 1e-15
+                    I_j = _eye_like(nj_op)
+                    nj_op = nj_op - ng * I_j
                 end
             end
 

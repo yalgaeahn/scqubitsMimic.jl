@@ -74,11 +74,11 @@ function build_symbolic_circuit(cg::CircuitGraph)
     node_vars = Num[Symbolics.variable(:φ, i) for i in 1:n]
     node_dot_vars = Num[Symbolics.variable(:φ̇, i) for i in 1:n]
 
-    # scqubits-style symbolic names: Φ1, Φ2, ... and ng1, ng2, ...
+    # scqubits-style symbolic names: Φ1, Φ2, ... and periodic-mode ng<i>
     ext_fluxes = Num[Num(Symbolics.variable(Symbol("Φ$(i)"))) for i in 1:n_ext]
 
-    # Offset charges: one per node (for periodic variables)
-    offset_charges = Num[Num(Symbolics.variable(Symbol("ng$(i)"))) for i in 1:n]
+    periodic_modes = _periodic_mode_indices(cg, n)
+    offset_charges = Num[Num(Symbolics.variable(Symbol("ng$(i)"))) for i in periodic_modes]
 
     # Branch flux allocations: per-branch symbolic flux
     branch_flux_alloc = _build_branch_flux_allocations(cg, sc_closure_indices, ext_fluxes)
@@ -116,6 +116,24 @@ function build_symbolic_circuit(cg::CircuitGraph)
         branch_flux_alloc,
         jj_terms
     )
+end
+
+function _periodic_mode_indices(cg::CircuitGraph, n::Int)
+    periodic_indices = Int[]
+    for node in 1:n
+        has_jj, has_inductor, has_capacitor = _node_connections(cg, node)
+
+        if !has_capacitor && !has_jj
+            continue
+        elseif !has_jj && !has_inductor
+            continue
+        elseif has_inductor
+            continue
+        else
+            push!(periodic_indices, node)
+        end
+    end
+    return periodic_indices
 end
 
 # ── Matrix construction ──────────────────────────────────────────────────────

@@ -71,7 +71,8 @@ export SymbolicCircuit, build_symbolic_circuit
 export compute_variable_transformation, VarCategories
 export Circuit, set_external_flux!, set_offset_charge!, invalidate_cache!,
        list_branch_params
-export sym_hamiltonian, sym_hamiltonian_node, variable_transformation,
+export sym_hamiltonian, sym_hamiltonian_node, sym_lagrangian,
+       variable_transformation, offset_charge_transformation,
        external_fluxes, sym_external_fluxes, offset_charges
 export SubCircuit, HierarchyLeaf, HierarchyGroup, HierarchyNode, hierarchical_diag
 

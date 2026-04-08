@@ -234,6 +234,92 @@ branches:
         @test_throws ErrorException get_param(circ, :ng99)
     end
 
+    @testset "Circuit periodic-only offset charges" begin
+        desc = """
+branches:
+  - [JJ, 0, 1, EJ=2.0, EC=1.0]
+  - [C, 1, 2, EC=0.5]
+  - [L, 0, 2, EL=0.6]
+"""
+        circ = Circuit(desc; ncut=6, cutoff_ext=8)
+
+        @test circ.var_categories.periodic == [1]
+        @test circ.var_categories.extended == [2]
+        @test string.(offset_charges(circ)) == ["ng1"]
+        @test get_param(circ, :ng1) == 0.0
+        @test_throws ErrorException set_param!(circ, :ng2, 0.1)
+        @test_throws ErrorException get_param(circ, :ng2)
+        @test_throws ArgumentError set_offset_charge!(circ, 2, 0.1)
+
+        evals0 = eigenvals(circ; evals_count=2)
+        set_param!(circ, :ng1, 0.25)
+        @test get_param(circ, :ng1) == 0.25
+        evals1 = eigenvals(circ; evals_count=2)
+        @test !isapprox(evals0[2] - evals0[1], evals1[2] - evals1[1]; atol=1e-8)
+    end
+
+    @testset "Circuit offset charge transformation" begin
+        Sym = ScQubitsMimic.Symbolics
+        desc = """
+branches:
+  - [L, 0, 1, EL=0.6]
+  - [C, 1, 2, EC=0.5]
+  - [JJ, 0, 2, EJ=8.0, EC=0.4]
+"""
+        circ = Circuit(desc; ncut=6)
+        @test circ.var_categories.periodic == [2]
+        @test circ.var_categories.extended == [1]
+
+        eqs = offset_charge_transformation(circ)
+        @test length(eqs) == 1
+        eq = eqs[1]
+        @test string(eq.lhs) == "ng2"
+        @test occursin("q_n1", string(eq.rhs)) || occursin("q_n2", string(eq.rhs))
+
+        Tt_inv = inv(circ.transformation_matrix')
+        q_nodes = [Sym.Num(Sym.variable(Symbol("q_n$(j)"))) for j in 1:circ.symbolic_circuit.graph.num_nodes]
+        expected_rhs = sum(Tt_inv[2, j] * q_nodes[j] for j in 1:length(q_nodes); init=Sym.Num(0))
+        @test string(ScQubitsMimic.Symbolics.simplify(eq.rhs - expected_rhs)) == "0"
+    end
+
+    @testset "Circuit cutoff property API" begin
+        desc = """
+branches:
+  - [JJ, 0, 1, EJ=2.0, EC=1.0]
+  - [C, 1, 2, EC=0.5]
+  - [L, 0, 2, EL=0.6]
+"""
+        circ = Circuit(desc; ncut=6, cutoff_ext=8)
+
+        @test circ.cutoff_names == [:cutoff_n_1, :cutoff_ext_2]
+        @test :cutoff_names in propertynames(circ)
+        @test :cutoff_n_1 in propertynames(circ)
+        @test :cutoff_ext_2 in propertynames(circ)
+        @test circ.cutoff_n_1 == 6
+        @test circ.cutoff_ext_2 == 8
+
+        hamiltonian(circ)
+        @test circ._hamiltonian_cache !== nothing
+
+        circ.cutoff_n_1 = 4
+        @test circ.cutoff_n_1 == 4
+        @test circ.cutoffs[1] == 9
+        @test circ._hamiltonian_cache === nothing
+
+        hamiltonian(circ)
+        circ.cutoff_ext_2 = 7
+        @test circ.cutoff_ext_2 == 7
+        @test circ.cutoffs[2] == 7
+        @test hilbertdim(circ) == 9 * 7
+        @test circ._hamiltonian_cache === nothing
+
+        @test_throws ArgumentError setproperty!(circ, :cutoff_n_2, 3)
+        @test_throws ArgumentError setproperty!(circ, :cutoff_ext_1, 3)
+        @test_throws ArgumentError setproperty!(circ, :cutoff_n_1, -1)
+        @test_throws ArgumentError setproperty!(circ, :cutoff_ext_2, 0)
+        @test_throws ArgumentError setproperty!(circ, :cutoff_n_1, 1.5)
+    end
+
     @testset "SpectrumLookup" begin
         t = Transmon(EJ=30.0, EC=1.2, ng=0.0, ncut=10, truncated_dim=4)
         osc = Oscillator(E_osc=6.0, truncated_dim=5)
@@ -823,6 +909,79 @@ branches:
         circ = Circuit(desc; ncut=15)
         _, vc = variable_transformation(circ)
         @test isempty(vc.frozen)
+    end
+
+    @testset "sym_lagrangian" begin
+        Sym = ScQubitsMimic.Symbolics
+
+        # Simple transmon: L has kinetic (φ̇) and Josephson (cos) terms
+        desc_transmon = """
+branches:
+  - [JJ, 0, 1, EJ=10.0, EC=0.3]
+  - [C, 0, 1, EC=0.5]
+"""
+        circ1 = Circuit(desc_transmon; ncut=10)
+        L_node = sym_lagrangian(circ1; vars_type=:node)
+        @test L_node isa Sym.Num
+        L_str = string(L_node)
+        @test occursin("φ̇", L_str)
+        @test occursin("cos", L_str)
+
+        # vars_type=:new should produce θ̇ variables
+        L_new = sym_lagrangian(circ1; vars_type=:new)
+        @test L_new isa Sym.Num
+        L_new_str = string(L_new)
+        @test occursin("θ̇", L_new_str)
+        @test occursin("cos", L_new_str)
+
+        # Fluxonium-like (JJ + L): inductive terms present
+        desc_flux = """
+branches:
+  - [JJ, 0, 1, EJ=8.0, EC=2.5]
+  - [L, 0, 1, EL=0.5]
+"""
+        circ2 = Circuit(desc_flux; ncut=10)
+        L_flux = sym_lagrangian(circ2; vars_type=:node)
+        L_flux_str = string(L_flux)
+        @test occursin("φ̇", L_flux_str)
+        @test occursin("cos", L_flux_str)
+
+        # External flux circuit: two JJs → Φ1 appears, no Φext
+        desc_ext = """
+branches:
+  - [JJ, 0, 1, EJ=10.0, EC=0.3]
+  - [JJ, 0, 1, EJ=10.0, EC=0.3]
+  - [C, 0, 1, EC=0.5]
+"""
+        circ3 = Circuit(desc_ext; ncut=10)
+        L_ext = sym_lagrangian(circ3; vars_type=:node)
+        L_ext_str = string(L_ext)
+        @test occursin("Φ1", L_ext_str)
+        @test !occursin("Φext", L_ext_str)
+
+        # Multi-node: both vars_type options work
+        desc_multi = """
+branches:
+  - [JJ, 0, 1, EJ=10.0, EC=0.3]
+  - [JJ, 0, 2, EJ=8.0, EC=0.4]
+  - [C, 1, 2, EC=0.1]
+"""
+        circ4 = Circuit(desc_multi; ncut=6)
+        L4_node = sym_lagrangian(circ4; vars_type=:node)
+        L4_new = sym_lagrangian(circ4; vars_type=:new)
+        @test L4_node isa Sym.Num
+        @test L4_new isa Sym.Num
+        @test occursin("φ̇", string(L4_node))
+        @test occursin("θ̇", string(L4_new))
+
+        # Invalid vars_type throws ArgumentError
+        @test_throws ArgumentError sym_lagrangian(circ1; vars_type=:invalid)
+
+        # Kinetic coefficient consistency: coefficient of φ̇₁² should be C/2
+        sc = circ1.symbolic_circuit
+        C_expected = 1 / (8 * 0.3) + 1 / (8 * 0.5)
+        c = Sym.coeff(Sym.expand(L_node), sc.node_dot_vars[1]^2)
+        @test Float64(Sym.value(c)) ≈ C_expected / 2 rtol=1e-10
     end
 
 end
