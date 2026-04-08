@@ -560,6 +560,25 @@ branches:
         @test evals_hier ≈ evals_full atol=1e-8
     end
 
+    @testset "Hierarchical diag: offset-charge regression" begin
+        # Nonzero offset charges should still match full direct diagonalization
+        desc = """
+branches:
+  - [JJ, 0, 1, EJ=10.0, EC=0.3]
+  - [JJ, 0, 2, EJ=8.0, EC=0.4]
+  - [C, 1, 2, EC=0.1]
+"""
+        circ = Circuit(desc; ncut=10, offset_charges=[0.2, -0.15])
+        evals_full = eigenvals(circ; evals_count=6)
+
+        hs = hierarchical_diag(circ;
+            system_hierarchy=[[1], [2]],
+            subsystem_trunc_dims=Dict(1=>21, 2=>21))
+        evals_hier = eigenvals(hs; evals_count=6)
+
+        @test evals_hier ≈ evals_full atol=1e-8
+    end
+
     @testset "Hierarchical diag: cross-group Josephson coupling" begin
         desc = """
 branches:
@@ -617,6 +636,25 @@ branches:
         evals_hier .-= evals_hier[1]
 
         @test evals_hier ≈ evals_full atol=1e-6
+    end
+
+    @testset "Hierarchical diag: inductive external-flux regression" begin
+        # A single JJ+L mode with external flux should match full direct diagonalization
+        desc = """
+branches:
+  - [JJ, 0, 1, EJ=8.0, EC=2.5]
+  - [L,  0, 1, EL=0.5]
+"""
+        circ = Circuit(desc; ncut=8, ext_basis=:harmonic)
+        set_external_flux!(circ, 1, 0.7)
+        evals_full = eigenvals(circ; evals_count=6)
+
+        hs = hierarchical_diag(circ;
+            system_hierarchy=[[1]],
+            subsystem_trunc_dims=Dict(1=>circ.cutoffs[1]))
+        evals_hier = eigenvals(hs; evals_count=6)
+
+        @test evals_hier ≈ evals_full atol=1e-8
     end
 
     @testset "Hierarchical diag: add_operator! and extra_H_terms" begin
