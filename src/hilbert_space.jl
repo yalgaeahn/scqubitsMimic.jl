@@ -21,10 +21,12 @@ mutable struct HilbertSpace <: AbstractQuantumSystem
     interactions::Vector{InteractionTerm}
     extra_H_terms::Vector{QuantumObject}   # pre-built operators added directly to H
     lookup::Union{Nothing, SpectrumLookup}
+    ignore_low_overlap::Bool
 end
 
-HilbertSpace(subsystems::Vector{<:AbstractQuantumSystem}) =
-    HilbertSpace(collect(AbstractQuantumSystem, subsystems), InteractionTerm[], QuantumObject[], nothing)
+HilbertSpace(subsystems::Vector{<:AbstractQuantumSystem}; ignore_low_overlap::Bool=false) =
+    HilbertSpace(collect(AbstractQuantumSystem, subsystems), InteractionTerm[], QuantumObject[],
+                 nothing, ignore_low_overlap)
 
 function hilbertdim(hs::HilbertSpace)
     return prod(hilbertdim(s) for s in hs.subsystems)

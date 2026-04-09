@@ -11,24 +11,39 @@ A dressed state is only assigned to a bare state when
 """
 const OVERLAP_THRESHOLD = 0.5
 
+"""Resolve the actual overlap threshold for a lookup build."""
+function _lookup_threshold(hs::HilbertSpace;
+                           overlap_threshold::Union{Nothing, Float64}=nothing,
+                           ignore_low_overlap::Union{Nothing, Bool}=nothing)
+    if overlap_threshold !== nothing
+        overlap_threshold < 0 && throw(ArgumentError(
+            "overlap_threshold must be nonnegative, got $overlap_threshold"))
+        return overlap_threshold
+    end
+    use_ignore_low_overlap = isnothing(ignore_low_overlap) ? hs.ignore_low_overlap : ignore_low_overlap
+    return use_ignore_low_overlap ? 0.0 : OVERLAP_THRESHOLD
+end
+
 """
-    generate_lookup!(hs::HilbertSpace; evals_count=10,
-                     overlap_threshold=OVERLAP_THRESHOLD)
+    _build_lookup(hs::HilbertSpace; evals_count=10,
+                  overlap_threshold=nothing,
+                  ignore_low_overlap=nothing)
 
-Diagonalize the full Hamiltonian and build bare ↔ dressed state mapping.
-Stores result in `hs.lookup`. Returns the `SpectrumLookup`.
+Build a `SpectrumLookup` for `hs` without mutating `hs.lookup`.
 
-The assignment algorithm matches scqubits DE (Dressed Energy) ordering:
-dressed states are processed in ascending index order; each dressed state is
-assigned to the bare product state with the largest `|⟨bare|dressed⟩|`,
-provided `|overlap|² > overlap_threshold`. Once a bare state is claimed it
-cannot be reused.
+The default threshold follows the HilbertSpace labeling policy:
+- `hs.ignore_low_overlap == false` → `OVERLAP_THRESHOLD`
+- `hs.ignore_low_overlap == true`  → `0.0`
 
-Set `overlap_threshold=0` to force assignment even for low overlaps (the
-previous default behavior).
+`overlap_threshold` and `ignore_low_overlap` are private overrides used by
+specialized analysis helpers that need a local lookup policy.
 """
-function generate_lookup!(hs::HilbertSpace; evals_count::Int=10,
-                          overlap_threshold::Float64=OVERLAP_THRESHOLD)
+function _build_lookup(hs::HilbertSpace; evals_count::Int=10,
+                       overlap_threshold::Union{Nothing, Float64}=nothing,
+                       ignore_low_overlap::Union{Nothing, Bool}=nothing)
+    resolved_threshold = _lookup_threshold(hs;
+                                           overlap_threshold=overlap_threshold,
+                                           ignore_low_overlap=ignore_low_overlap)
     # Dressed eigensystem
     dressed_vals, dressed_vecs = eigensys(hs; evals_count=evals_count)
     n_dressed = length(dressed_vals)
@@ -82,7 +97,7 @@ function generate_lookup!(hs::HilbertSpace; evals_count::Int=10,
         max_pos = argmax(@view ov_work[dressed_idx, :])
         max_ov = sqrt(ov_work[dressed_idx, max_pos])  # |⟨bare|dressed⟩|
 
-        if max_ov^2 > overlap_threshold
+        if max_ov^2 > resolved_threshold
             # Claim this bare state (zero its column to prevent reuse)
             ov_work[:, max_pos] .= 0.0
 
@@ -92,11 +107,55 @@ function generate_lookup!(hs::HilbertSpace; evals_count::Int=10,
         end
     end
 
-    lookup = SpectrumLookup(dressed_vals, dressed_vecs, bare_evals,
-                             overlap, bare_to_dressed, dressed_to_bare)
+    return SpectrumLookup(dressed_vals, dressed_vecs, bare_evals,
+                          overlap, bare_to_dressed, dressed_to_bare)
+end
+
+"""
+    generate_lookup!(hs::HilbertSpace; evals_count=10, overlap_threshold=nothing)
+
+Diagonalize the full Hamiltonian and build bare ↔ dressed state mapping.
+Stores result in `hs.lookup`. Returns the `SpectrumLookup`.
+
+By default, the labeling policy follows `hs.ignore_low_overlap` in the same
+spirit as scqubits:
+- `false` uses the default DE overlap threshold `OVERLAP_THRESHOLD`
+- `true` forces label assignment even for low-overlap states
+
+The optional `overlap_threshold` keyword is retained for compatibility, but the
+public workflow should prefer `HilbertSpace(...; ignore_low_overlap=...)`.
+"""
+function generate_lookup!(hs::HilbertSpace; evals_count::Int=10,
+                          overlap_threshold::Union{Nothing, Float64}=nothing)
+    lookup = _build_lookup(hs; evals_count=evals_count,
+                           overlap_threshold=overlap_threshold)
     hs.lookup = lookup
     return lookup
 end
+
+function _lookup_dressed_index(lookup::SpectrumLookup, bare_labels::Tuple)
+    haskey(lookup.bare_to_dressed, bare_labels) || error(
+        "Bare state $bare_labels not found in lookup. " *
+        "Increase evals_count or use ignore_low_overlap=true for labeling.")
+    return lookup.bare_to_dressed[bare_labels]
+end
+
+_lookup_dressed_index(lookup::SpectrumLookup, bare_labels::Int...) =
+    _lookup_dressed_index(lookup, Tuple(bare_labels))
+
+function _lookup_bare_index(lookup::SpectrumLookup, dressed_idx::Int)
+    haskey(lookup.dressed_to_bare, dressed_idx) ||
+        error("Dressed index $dressed_idx not found in lookup table")
+    return lookup.dressed_to_bare[dressed_idx]
+end
+
+function _lookup_energy_by_bare_index(lookup::SpectrumLookup, bare_labels::Tuple)
+    idx = _lookup_dressed_index(lookup, bare_labels)
+    return lookup.dressed_evals[idx]
+end
+
+_lookup_energy_by_bare_index(lookup::SpectrumLookup, bare_labels::Int...) =
+    _lookup_energy_by_bare_index(lookup, Tuple(bare_labels))
 
 """
     dressed_index(hs::HilbertSpace, bare_labels::Int...)
@@ -109,10 +168,7 @@ ground state of subsystem 1 and first excited state of subsystem 2.
 """
 function dressed_index(hs::HilbertSpace, bare_labels::Int...)
     hs.lookup === nothing && error("Call generate_lookup!(hs) first")
-    key = Tuple(bare_labels)
-    haskey(hs.lookup.bare_to_dressed, key) ||
-        error("Bare state $key not found in lookup table")
-    return hs.lookup.bare_to_dressed[key]
+    return _lookup_dressed_index(hs.lookup, bare_labels...)
 end
 
 """
@@ -123,9 +179,7 @@ Returns a tuple of 1-based eigenstate indices for each subsystem.
 """
 function bare_index(hs::HilbertSpace, dressed_idx::Int)
     hs.lookup === nothing && error("Call generate_lookup!(hs) first")
-    haskey(hs.lookup.dressed_to_bare, dressed_idx) ||
-        error("Dressed index $dressed_idx not found in lookup table")
-    return hs.lookup.dressed_to_bare[dressed_idx]
+    return _lookup_bare_index(hs.lookup, dressed_idx)
 end
 
 """
@@ -144,8 +198,8 @@ end
 Return the dressed eigenvalue for the state labeled by bare quantum numbers.
 """
 function energy_by_bare_index(hs::HilbertSpace, bare_labels::Int...)
-    idx = dressed_index(hs, bare_labels...)
-    return hs.lookup.dressed_evals[idx]
+    hs.lookup === nothing && error("Call generate_lookup!(hs) first")
+    return _lookup_energy_by_bare_index(hs.lookup, bare_labels...)
 end
 
 """

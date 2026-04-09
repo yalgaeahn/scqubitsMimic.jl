@@ -49,6 +49,10 @@ At each parameter point, the callback updates subsystem parameters,
 the full Hamiltonian is rebuilt and diagonalized, and bare/dressed
 state mappings are computed.
 
+Stored sweep lookups use a sweep-local labeling policy controlled by
+`ignore_low_overlap`; this setting is independent from
+`hs.ignore_low_overlap`.
+
 # Example
 ```julia
 tmon = TunableTransmon(EJmax=20.0, EC=0.3, d=0.1)
@@ -72,6 +76,7 @@ sweep = HilbertSpaceSweep(hs,
 - `dressed_evals`  — dressed eigenvalues at each sweep point
 - `bare_evals`     — bare eigenvalues per subsystem at each sweep point
 - `lookups`        — SpectrumLookup at each sweep point (optional)
+- `ignore_low_overlap` — sweep-local lookup policy used when `store_lookups=true`
 """
 struct HilbertSpaceSweep
     hilbertspace::HilbertSpace
@@ -79,11 +84,13 @@ struct HilbertSpaceSweep
     dressed_evals::Array{Float64}     # n_points × evals_count
     bare_evals::Vector{Vector{Vector{Float64}}}  # [point][subsys][evals]
     lookups::Union{Nothing, Vector{SpectrumLookup}}
+    ignore_low_overlap::Bool
 end
 
 """
     HilbertSpaceSweep(hs, paramvals_by_name, update_hilbertspace!;
-                      evals_count=10, store_lookups=false)
+                      evals_count=10, store_lookups=false,
+                      ignore_low_overlap=false)
 
 Perform a parameter sweep over a HilbertSpace.
 
@@ -95,12 +102,17 @@ Perform a parameter sweep over a HilbertSpace.
   `Dict{Symbol, Float64}` with current parameter values.
 - `evals_count` — number of dressed eigenvalues to compute
 - `store_lookups` — whether to store full SpectrumLookup at each point
+- `ignore_low_overlap` — if `true`, force low-overlap bare↔dressed assignments
+  for the stored sweep lookups only. This flag is **not** inherited from
+  `hs.ignore_low_overlap`; pass `ignore_low_overlap=true` explicitly when a
+  strong-hybridization sweep needs relaxed bare-label tracking.
 """
 function HilbertSpaceSweep(hs::HilbertSpace,
                             paramvals_by_name::Dict{Symbol, <:AbstractVector},
                             update_hilbertspace!::Function;
                             evals_count::Int=10,
-                            store_lookups::Bool=false)
+                            store_lookups::Bool=false,
+                            ignore_low_overlap::Bool=false)
     # Convert to concrete types
     param_dict = Dict{Symbol, Vector{Float64}}(
         k => collect(Float64, v) for (k, v) in paramvals_by_name)
@@ -142,7 +154,8 @@ function HilbertSpaceSweep(hs::HilbertSpace,
 
             # Optionally store full lookup
             if store_lookups
-                lookup = generate_lookup!(hs; evals_count=evals_count)
+                lookup = _build_lookup(hs; evals_count=evals_count,
+                                       ignore_low_overlap=ignore_low_overlap)
                 lookups_vec[idx] = lookup
             end
         end
@@ -160,7 +173,8 @@ function HilbertSpaceSweep(hs::HilbertSpace,
             dressed_evals[idx, :] .= vals
 
             if store_lookups
-                lookup = generate_lookup!(hs; evals_count=evals_count)
+                lookup = _build_lookup(hs; evals_count=evals_count,
+                                       ignore_low_overlap=ignore_low_overlap)
                 lookups_vec[idx] = lookup
             end
             idx += 1
@@ -168,5 +182,5 @@ function HilbertSpaceSweep(hs::HilbertSpace,
     end
 
     return HilbertSpaceSweep(hs, param_dict, dressed_evals,
-                              bare_evals_all, lookups_vec)
+                              bare_evals_all, lookups_vec, ignore_low_overlap)
 end

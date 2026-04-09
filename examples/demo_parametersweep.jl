@@ -38,6 +38,11 @@ end
 println("\n--- HilbertSpace flux sweep (dressed spectrum) ---")
 flux_vals = collect(range(0.0, 0.5, length=11))
 
+# HilbertSpaceSweep uses strict bare↔dressed labeling by default.
+# This sweep-local policy is independent from hs.ignore_low_overlap.
+# Near strong hybridization, rerun the sweep with ignore_low_overlap=true
+# if you want more aggressive bare-label tracking.
+
 sweep = HilbertSpaceSweep(hs,
     Dict(:flux => flux_vals),
     (hs, vals) -> begin
@@ -66,6 +71,10 @@ tmon.flux = 0.0  # reset
 # --- 5. Sweep with lookup (state tracking) ---
 println("\n--- Sweep with bare/dressed state tracking ---")
 flux_fine = collect(range(0.0, 0.5, length=6))
+
+# store_lookups=true preserves the sweep-local lookup policy.
+# If a strong avoided crossing causes bare labels to disappear, explicitly
+# pass ignore_low_overlap=true to this HilbertSpaceSweep call.
 
 sweep2 = HilbertSpaceSweep(hs,
     Dict(:flux => flux_fine),
@@ -130,6 +139,8 @@ println("Bus resonator: ω=$(bus.E_osc) GHz")
 println("Total Hilbert space: $(hilbertdim(hs3))")
 
 # Sweep qubit 1 flux
+# The same strict-by-default lookup policy applies here; enable
+# ignore_low_overlap=true explicitly only when you need relaxed state tracking.
 sweep3 = HilbertSpaceSweep(hs3,
     Dict(:flux1 => collect(range(0.0, 0.4, length=5))),
     (hs, vals) -> begin

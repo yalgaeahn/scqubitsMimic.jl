@@ -362,6 +362,30 @@ branches:
         @test energy_by_bare_index(hs, 1, 1) ≈ lookup.dressed_evals[1]
     end
 
+    @testset "SpectrumLookup labeling policy" begin
+        osc1_strict = Oscillator(E_osc=5.0, truncated_dim=3)
+        osc2_strict = Oscillator(E_osc=5.0, truncated_dim=3)
+        hs_strict = HilbertSpace([osc1_strict, osc2_strict])
+        add_interaction!(hs_strict, 0.2, [osc1_strict, osc2_strict],
+            [s -> annihilation_operator(s) + creation_operator(s),
+             s -> annihilation_operator(s) + creation_operator(s)])
+
+        strict_lookup = generate_lookup!(hs_strict; evals_count=9)
+        @test get(strict_lookup.bare_to_dressed, (1, 2), nothing) === nothing
+        @test get(strict_lookup.bare_to_dressed, (2, 1), nothing) === nothing
+
+        osc1_relaxed = Oscillator(E_osc=5.0, truncated_dim=3)
+        osc2_relaxed = Oscillator(E_osc=5.0, truncated_dim=3)
+        hs_relaxed = HilbertSpace([osc1_relaxed, osc2_relaxed]; ignore_low_overlap=true)
+        add_interaction!(hs_relaxed, 0.2, [osc1_relaxed, osc2_relaxed],
+            [s -> annihilation_operator(s) + creation_operator(s),
+             s -> annihilation_operator(s) + creation_operator(s)])
+
+        relaxed_lookup = generate_lookup!(hs_relaxed; evals_count=9)
+        @test haskey(relaxed_lookup.bare_to_dressed, (1, 2))
+        @test haskey(relaxed_lookup.bare_to_dressed, (2, 1))
+    end
+
     @testset "op_in_dressed_eigenbasis" begin
         t = Transmon(EJ=30.0, EC=1.2, ng=0.0, ncut=10, truncated_dim=4)
         osc = Oscillator(E_osc=6.0, truncated_dim=5)
@@ -401,6 +425,48 @@ branches:
         w01_0 = sweep.dressed_evals[1, 2] - sweep.dressed_evals[1, 1]
         w01_half = sweep.dressed_evals[3, 2] - sweep.dressed_evals[3, 1]
         @test w01_0 > w01_half
+    end
+
+    @testset "HilbertSpaceSweep labeling policy" begin
+        osc1 = Oscillator(E_osc=5.0, truncated_dim=3)
+        osc2 = Oscillator(E_osc=5.0, truncated_dim=3)
+        hs = HilbertSpace([osc1, osc2]; ignore_low_overlap=true)
+        add_interaction!(hs, 0.2, [osc1, osc2],
+            [s -> annihilation_operator(s) + creation_operator(s),
+             s -> annihilation_operator(s) + creation_operator(s)])
+
+        # Sweep defaults remain strict even when the source HilbertSpace
+        # uses relaxed single-point lookup labeling.
+        default_sweep = HilbertSpaceSweep(hs,
+            Dict(:ω2 => [5.0]),
+            (hs, vals) -> begin
+                osc2.E_osc = vals[:ω2]
+            end;
+            evals_count=9,
+            store_lookups=true)
+
+        # Relaxed sweep labeling is explicit and independent.
+        relaxed_sweep = HilbertSpaceSweep(hs,
+            Dict(:ω2 => [5.0]),
+            (hs, vals) -> begin
+                osc2.E_osc = vals[:ω2]
+            end;
+            evals_count=9,
+            store_lookups=true,
+            ignore_low_overlap=true)
+
+        @test hs.ignore_low_overlap
+        @test default_sweep.ignore_low_overlap == false
+        @test relaxed_sweep.ignore_low_overlap
+        @test default_sweep.lookups !== nothing
+        @test relaxed_sweep.lookups !== nothing
+        @test get(default_sweep.lookups[1].bare_to_dressed, (1, 2), nothing) === nothing
+        @test haskey(relaxed_sweep.lookups[1].bare_to_dressed, (1, 2))
+
+        # Sweep-based dispersive analysis follows the sweep lookup policy only.
+        @test_throws ErrorException chi_matrix(default_sweep)
+        chi_relaxed = chi_matrix(relaxed_sweep)
+        @test size(chi_relaxed) == (1, 2, 2)
     end
 
     @testset "Dispersive shifts (chi/Kerr)" begin
@@ -1240,7 +1306,7 @@ branches:
         H_full = sym_hamiltonian(circ)
         H1 = sym_hamiltonian(circ; subsystem_index=1)
         H2 = sym_hamiltonian(circ; subsystem_index=2)
-        H_int = sym_interaction(circ; subsystem_indices=(1, 2), return_expr=true)
+        H_int = ScQubitsMimic._raw_subsystem_interaction_expr(circ, (1, 2))
 
         # H1 + H2 + H_int should equal H_full (symbolic difference simplifies to 0)
         diff = Sym.simplify(Sym.expand(H1 + H2 + H_int - H_full))
@@ -1320,105 +1386,16 @@ branches:
         @test !isequal(H123, Sym.Num(0))
         @test isequal(H123, H123_rev)
 
+        synthetic_12 = Sym.Num(0.123456) * Sym.variable(:nθ, 1) * Sym.variable(:nθ, 2) +
+                       external_fluxes(circ)[1]
+        circ._subsystem_interactions_sym[Set([1, 2])] = synthetic_12
+        H12_fmt = sym_interaction(circ; subsystem_indices=(1, 2), float_round=2, return_expr=true)
+        H12_expected = ScQubitsMimic._format_interaction_expr(circ, synthetic_12; float_round=2)
+        @test isequal(H12_fmt, H12_expected)
+
         # Non-return mode should print and return `nothing`.
         @test sym_interaction(circ; subsystem_indices=(1, 2), return_expr=false) === nothing
         @test sym_interaction(circ; subsystem_indices=(1, 2), return_expr=false, print_latex=true) === nothing
-    end
-
-    @testset "effective_hamiltonian on simple two-subsystem circuit" begin
-        desc = """
-branches:
-  - [JJ, 0, 1, EJ=10.0, EC=0.3]
-  - [JJ, 0, 2, EJ=8.0, EC=0.4]
-  - [C, 1, 2, EC=0.1]
-"""
-        circ = Circuit(desc; ncut=10)
-        configure!(circ; system_hierarchy=[[1], [2]], subsystem_trunc_dims=[10, 10])
-
-        eff = effective_hamiltonian(circ; projection_dims=(2, 2), decompose_pauli=true)
-        @test eff.basis_labels == [(1, 1), (1, 2), (2, 1), (2, 2)]
-        @test size(eff.overlap_matrix) == (4, 4)
-        @test isapprox(eff.H_full_eff, eff.H_full_eff', atol=1e-10)
-        @test isapprox(eff.H_int_eff, eff.H_int_eff', atol=1e-10)
-        @test isapprox(eff.H_full_eff, eff.H_bare_eff + eff.H_int_eff, atol=1e-10)
-        @test eff.pauli_terms !== nothing
-
-        # The overlap_matrix (sub-selection) diagonal should be positive —
-        # each selected dressed state has meaningful overlap with its bare counterpart.
-        gram = eff.overlap_matrix' * eff.overlap_matrix
-        @test all(real(diag(gram)) .> 0.1)
-
-        # Pauli decomposition is on H_int_eff (not H_full_eff)
-        pauli = Dict(
-            'I' => ComplexF64[1 0; 0 1],
-            'X' => ComplexF64[0 1; 1 0],
-            'Y' => ComplexF64[0 -im; im 0],
-            'Z' => ComplexF64[1 0; 0 -1],
-        )
-        recon = zeros(ComplexF64, size(eff.H_int_eff))
-        for (label, coeff) in eff.pauli_terms
-            op = reduce(kron, (pauli[sym] for sym in label))
-            recon .+= coeff .* op
-        end
-        @test isapprox(recon, eff.H_int_eff, atol=1e-10)
-    end
-
-    @testset "Yan-style effective Hamiltonian and avoided crossing" begin
-        desc = """
-branches:
-  - [JJ, 0, 1, EJ=4.5, EC=0.1]
-  - [JJ, 1, 0, EJ=10.5, EC=0.1]
-  - [C, 1, 0, EC=0.2]
-  - [C, 1, 2, EC=5.0]
-  - [JJ, 0, 2, EJ=30.0, EC=0.1]
-  - [JJ, 2, 0, EJ=20.0, EC=0.1]
-  - [C, 2, 0, EC=0.1]
-  - [C, 2, 3, EC=5.0]
-  - [JJ, 0, 3, EJ=4.6, EC=0.1]
-  - [JJ, 3, 0, EJ=10.0, EC=0.1]
-  - [C, 3, 0, EC=0.2]
-  - [C, 1, 3, EC=500.0]
-"""
-        circ = Circuit(desc; ncut=6)
-        set_param!(circ, :Φ1, 0.0)
-        set_param!(circ, :Φ2, 0.0)
-        set_param!(circ, :Φ3, 0.0)
-        configure!(circ; system_hierarchy=[[1], [2], [3]], subsystem_trunc_dims=[6, 6, 6])
-
-        eff_222 = effective_hamiltonian(circ; projection_dims=(2, 2, 2), decompose_pauli=true)
-        @test size(eff_222.overlap_matrix) == (8, 8)
-        @test isapprox(eff_222.H_full_eff, eff_222.H_full_eff', atol=1e-10)
-        @test isapprox(eff_222.H_full_eff, eff_222.H_bare_eff + eff_222.H_int_eff, atol=1e-10)
-        g12 = exchange_coupling(eff_222.H_int_eff, eff_222.basis_labels, (2, 1, 1), (1, 2, 1))
-        g23 = exchange_coupling(eff_222.H_int_eff, eff_222.basis_labels, (1, 2, 1), (1, 1, 2))
-        g13 = exchange_coupling(eff_222.H_int_eff, eff_222.basis_labels, (2, 1, 1), (1, 1, 2))
-        @test g12 > g13
-        @test g23 > g13
-        @test g13 > 0
-        @test eff_222.pauli_terms !== nothing
-
-        eff_232 = effective_hamiltonian(circ; projection_dims=(2, 3, 2), decompose_pauli=false)
-        @test length(eff_232.basis_labels) == 12
-        @test size(eff_232.H_full_eff) == (12, 12)
-        @test eff_232.pauli_terms === nothing
-
-        sweep_vals = collect(2π .* range(-0.45, -0.35; length=21))
-        crossing = avoided_crossing_coupling(circ;
-            state_a=(2, 1, 1),
-            state_b=(1, 2, 1),
-            sweep_param=:Φ2,
-            sweep_vals=sweep_vals,
-            evals_count=16)
-        endpoint_min = min(crossing.gap[1], crossing.gap[end])
-        @test -0.45 <= crossing.param_at_min_gap / (2π) <= -0.35
-        @test abs(crossing.param_at_min_gap / (2π) + 0.4) < 0.03
-        @test crossing.min_gap < endpoint_min
-        @test crossing.g_half_gap > 0
-
-        set_param!(circ, :Φ2, crossing.param_at_min_gap)
-        eff_res = effective_hamiltonian(circ; projection_dims=(2, 2, 2), decompose_pauli=false)
-        g_proj = exchange_coupling(eff_res.H_int_eff, eff_res.basis_labels, (2, 1, 1), (1, 2, 1))
-        @test 0.25 <= crossing.g_half_gap / g_proj <= 4.0
     end
 
     @testset "invalidate_cache! clears numerical but keeps symbolic" begin

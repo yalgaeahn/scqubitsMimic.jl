@@ -437,11 +437,11 @@ Ordering is ignored, so `(1,2,3)` and `(3,1,2)` are equivalent.
 # Keywords
 - `float_round::Int=6` — round floating-point coefficients to this many
   decimal places in the returned/printed expression (matches scqubits
-  `_make_expr_human_readable`).
+  `_make_expr_human_readable` behavior).
 - `print_latex::Bool=false` — additionally print LaTeX representation.
 - `return_expr::Bool=false` — if `true`, suppress printing and return the
-  expression. **Note:** the scqubits default is `False` (print mode); we match
-  that here.
+  formatted expression. **Note:** the scqubits default is `False` (print mode);
+  we match that here.
 
 Requires [`configure!`](@ref) to have been called first.
 """
@@ -450,6 +450,22 @@ function sym_interaction(circ::Circuit;
                          float_round::Int=6,
                          print_latex::Bool=false,
                          return_expr::Bool=false)
+    expr = _raw_subsystem_interaction_expr(circ, subsystem_indices)
+    display_expr = _format_interaction_expr(circ, expr; float_round=float_round)
+
+    if return_expr
+        return display_expr
+    end
+
+    if print_latex
+        println(latexify(display_expr))
+    end
+    println(display_expr)
+    return nothing
+end
+
+function _raw_subsystem_interaction_expr(circ::Circuit,
+                                         subsystem_indices::Tuple{Vararg{Int}})
     circ._hierarchical_diagonalization ||
         error("sym_interaction requires configure!() to be called first")
     circ._subsystem_interactions_sym === nothing &&
@@ -459,24 +475,12 @@ function sym_interaction(circ::Circuit;
         "subsystem_indices must contain at least two subsystem indices."
     ))
     key = Set(unique_subsystems)
-    expr = get(circ._subsystem_interactions_sym, key, Num(0))
+    return get(circ._subsystem_interactions_sym, key, Num(0))
+end
 
-    if return_expr
-        # Return the raw symbolic expression (no rounding / flux rewriting)
-        # so it stays compatible with symbolic manipulation and completeness
-        # checks (H1 + H2 + H_int == H_full).
-        return expr
-    end
-
-    # For display, apply human-readable transformations matching scqubits.
+function _format_interaction_expr(circ::Circuit, expr::Num; float_round::Int=6)
     display_expr = _round_symbolic_floats(expr, float_round)
-    display_expr = _humanize_external_fluxes(circ, display_expr)
-
-    if print_latex
-        println(latexify(display_expr))
-    end
-    println(display_expr)
-    return nothing
+    return _humanize_external_fluxes(circ, display_expr)
 end
 
 """Round floating-point literal coefficients in a Symbolics expression."""

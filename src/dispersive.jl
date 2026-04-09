@@ -29,6 +29,9 @@ end
 
 Chi matrix at each sweep point. Returns array of size `(n_points, n_sub, n_sub)`.
 Requires the sweep to have been created with `store_lookups=true`.
+The result depends only on the lookups stored on the sweep itself; if strong
+hybridization requires relaxed bare-label tracking, construct the sweep with
+`ignore_low_overlap=true`.
 """
 function chi_matrix(sweep::HilbertSpaceSweep)
     sweep.lookups === nothing &&
@@ -92,6 +95,7 @@ end
     self_kerr(sweep::HilbertSpaceSweep, subsys_idx::Int) -> Vector{Float64}
 
 Self-Kerr at each sweep point. Requires `store_lookups=true`.
+Uses the sweep-stored lookup policy, not `sweep.hilbertspace.ignore_low_overlap`.
 """
 function self_kerr(sweep::HilbertSpaceSweep, subsys_idx::Int)
     sweep.lookups === nothing &&
@@ -148,6 +152,7 @@ end
     lamb_shift(sweep::HilbertSpaceSweep, subsys_idx::Int) -> Vector{Float64}
 
 Lamb shift at each sweep point. Requires `store_lookups=true`.
+Uses the sweep-stored lookup policy, not `sweep.hilbertspace.ignore_low_overlap`.
 """
 function lamb_shift(sweep::HilbertSpaceSweep, subsys_idx::Int)
     sweep.lookups === nothing &&
@@ -175,6 +180,7 @@ function _energy_from_lookup(lookup::SpectrumLookup, bare_label::Tuple)
     idx = get(lookup.bare_to_dressed, bare_label, nothing)
     idx === nothing && error(
         "Bare state $bare_label not found in lookup. " *
-        "Increase evals_count in generate_lookup! or HilbertSpaceSweep.")
+        "Increase evals_count or regenerate the relevant lookup with " *
+        "ignore_low_overlap=true.")
     return lookup.dressed_evals[idx]
 end

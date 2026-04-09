@@ -41,7 +41,6 @@ include("hilbert_space.jl")
 include("spectrum_lookup.jl")
 include("param_sweep.jl")
 include("dispersive.jl")
-include("effective_hamiltonian.jl")
 
 # ── Exports ──────────────────────────────────────────────────────────────────
 
@@ -104,7 +103,6 @@ export generate_lookup!, dressed_index, bare_index,
        energy_by_dressed_index, energy_by_bare_index,
        op_in_dressed_eigenbasis, OVERLAP_THRESHOLD
 export chi_matrix, self_kerr, lamb_shift
-export effective_hamiltonian, exchange_coupling, avoided_crossing_coupling
 
 # Plotting API stubs (implemented in ext/ScQubitsMimicMakieExt)
 function plot_evals_vs_paramvals end
