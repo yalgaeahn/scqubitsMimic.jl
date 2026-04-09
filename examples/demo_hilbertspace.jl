@@ -9,8 +9,8 @@ using LinearAlgebra
 
 # --- 1. Define subsystems ---
 # Two Kerr oscillators coupled via a shared inductance (rf SQUID coupling)
-kosc1 = KerrOscillator(E_osc=4.5, K=-0.05, truncated_dim=8)
-kosc2 = KerrOscillator(E_osc=6.0, K=-0.03, truncated_dim=8)
+kosc1 = KerrOscillator(E_osc=4.5, K=0.05, truncated_dim=8)
+kosc2 = KerrOscillator(E_osc=6.0, K=0.03, truncated_dim=8)
 
 println("Subsystem 1: KerrOscillator, ω=$(kosc1.E_osc) GHz, K=$(kosc1.K) GHz")
 println("Subsystem 2: KerrOscillator, ω=$(kosc2.E_osc) GHz, K=$(kosc2.K) GHz")

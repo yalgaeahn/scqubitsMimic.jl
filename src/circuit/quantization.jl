@@ -50,6 +50,17 @@ mutable struct Circuit <: AbstractQuantumSystem
 
     # Cache
     _hamiltonian_cache::Union{Nothing, QuantumObject}
+
+    # Hierarchical diagonalization configuration (set by configure!)
+    # Types use Any/Vector to avoid forward-reference issues (SubCircuit, HilbertSpace
+    # are defined in files loaded after quantization.jl)
+    _system_hierarchy::Union{Nothing, Vector}
+    _subsystem_trunc_dims::Any                          # nothing or Dict
+    _subsystems::Union{Nothing, Vector}                 # Vector{SubCircuit} when set
+    _hilbert_space::Any                                 # HilbertSpace when set
+    _subsystem_sym_hamiltonians::Union{Nothing, Dict{Int, Num}}
+    _subsystem_interactions_sym::Union{Nothing, Dict{Set{Int}, Num}}
+    _hierarchical_diagonalization::Bool
 end
 
 """
@@ -96,7 +107,9 @@ function Circuit(description::String;
     circ = Circuit(sc, T, vc, H_mode,
                    cutoffs, ext_basis, phi_ranges, Dict{Int, Float64}(),
                    ext_vals, ng_vals,
-                   Dict{Tuple{Int, Symbol}, Float64}(), nothing)
+                   Dict{Tuple{Int, Symbol}, Float64}(), nothing,
+                   # Hierarchical diagonalization config (initially unconfigured)
+                   nothing, nothing, nothing, nothing, nothing, nothing, false)
 
     # Compute oscillator lengths (needs the Circuit to read branch params)
     circ.osc_lengths = _compute_osc_lengths(circ)
@@ -135,15 +148,212 @@ function invalidate_cache!(circ::Circuit)
     if !isempty(circ.branch_param_overrides)
         circ.osc_lengths = _compute_osc_lengths(circ)
     end
+    # Clear numerical HD results (symbolic decomposition stays valid)
+    if circ._hierarchical_diagonalization
+        circ._hilbert_space = nothing
+        circ._subsystems = nothing
+    end
+end
+
+# ── Hierarchical diagonalization configuration ─────────────────────────────
+
+"""
+    _decompose_sym_hamiltonian(circ::Circuit, system_hierarchy::Vector)
+
+Decompose `circ.mode_hamiltonian_symbolic` into per-subsystem Hamiltonians
+and inter-subsystem interaction terms based on which mode variables appear.
+
+Returns `(subsys_H, interactions)` where:
+- `subsys_H::Dict{Int, Num}` maps 1-based subsystem group index to its symbolic H
+- `interactions::Dict{Set{Int}, Num}` maps sets of group indices to symbolic coupling
+"""
+function _decompose_sym_hamiltonian(circ::Circuit, system_hierarchy::Vector)
+    n = circ.symbolic_circuit.graph.num_nodes
+
+    # Build mode_index → group_index mapping (1-based groups)
+    mode_to_group = Dict{Int, Int}()
+    # system_hierarchy is a flat list of lists, e.g., [[1], [2]] or [[1,3], [2]]
+    # Each element (at the top level for flat hierarchy) is a group
+    flat_groups = _flatten_hierarchy_groups(system_hierarchy)
+    for (gi, group) in enumerate(flat_groups)
+        for mi in group
+            mode_to_group[mi] = gi
+        end
+    end
+    n_groups = length(flat_groups)
+
+    # Build variable → mode_index lookup
+    var_to_mode = Dict{Any, Int}()
+    for i in 1:n
+        var_to_mode[Symbolics.unwrap(Symbolics.variable(:θ, i))] = i
+        var_to_mode[Symbolics.unwrap(Symbolics.variable(:nθ, i))] = i
+    end
+
+    # Initialize accumulators
+    subsys_H = Dict{Int, Num}(gi => Num(0) for gi in 1:n_groups)
+    interactions = Dict{Set{Int}, Num}()
+
+    # Expand the Hamiltonian to separate additive terms
+    H_expanded = Symbolics.expand(circ.mode_hamiltonian_symbolic)
+    H_unwrapped = Symbolics.unwrap(H_expanded)
+
+    # Extract additive terms
+    terms = if Symbolics.iscall(H_unwrapped) && Symbolics.operation(H_unwrapped) === (+)
+        Symbolics.arguments(H_unwrapped)
+    else
+        [H_unwrapped]
+    end
+
+    for raw_term in terms
+        term = Symbolics.wrap(raw_term)
+        vars = Symbolics.get_variables(term)
+
+        # Find which subsystem groups are involved
+        involved_groups = Set{Int}()
+        for v in vars
+            vu = Symbolics.unwrap(v)
+            if haskey(var_to_mode, vu)
+                mi = var_to_mode[vu]
+                if haskey(mode_to_group, mi)
+                    push!(involved_groups, mode_to_group[mi])
+                end
+            end
+        end
+
+        if length(involved_groups) == 0
+            # Constant term (no mode variables) → assign to group 1
+            subsys_H[1] = subsys_H[1] + term
+        elseif length(involved_groups) == 1
+            g = only(involved_groups)
+            subsys_H[g] = subsys_H[g] + term
+        else
+            key = Set(involved_groups)
+            interactions[key] = get(interactions, key, Num(0)) + term
+        end
+    end
+
+    return (subsys_H, interactions)
+end
+
+"""Extract flat list of leaf mode-index groups from a system_hierarchy specification."""
+function _flatten_hierarchy_groups(hierarchy::Vector)
+    groups = Vector{Int}[]
+    for item in hierarchy
+        if item isa Vector{Int}
+            push!(groups, item)
+        elseif item isa Vector
+            # Nested group: recursively flatten all leaves within it into one group
+            push!(groups, _collect_all_modes(item))
+        else
+            error("Invalid system_hierarchy element: $item")
+        end
+    end
+    return groups
+end
+
+"""Recursively collect all mode indices from a nested hierarchy element."""
+function _collect_all_modes(v::Vector{Int})
+    return copy(v)
+end
+
+function _collect_all_modes(v::Vector)
+    modes = Int[]
+    for item in v
+        append!(modes, _collect_all_modes(item))
+    end
+    return modes
+end
+
+"""
+    configure!(circ::Circuit; system_hierarchy, subsystem_trunc_dims)
+
+Configure hierarchical diagonalization for the circuit, storing hierarchy
+metadata and computing both symbolic and numerical decompositions.
+
+This is the Julia equivalent of `circ.configure(...)` in Python scqubits.
+After calling, the circuit provides:
+- `sym_hamiltonian(circ; subsystem_index=i)` for per-subsystem symbolic Hamiltonians
+- `sym_interaction(circ; subsystem_indices=(i,j))` for symbolic interaction terms
+- `circ._subsystems` for the diagonalized subsystem objects
+- `circ._hilbert_space` for the diagonalized composite system
+
+Uses 1-based indexing (Julia convention) for subsystem indices.
+
+# Example
+```julia
+configure!(circ; system_hierarchy=[[1],[2]], subsystem_trunc_dims=Dict(1=>10, 2=>10))
+sym_hamiltonian(circ; subsystem_index=1)      # symbolic H for subsystem 1
+sym_interaction(circ; subsystem_indices=(1,2)) # coupling between subsystems 1 and 2
+```
+"""
+function configure!(circ::Circuit; system_hierarchy, subsystem_trunc_dims)
+    # Store configuration
+    circ._system_hierarchy = system_hierarchy
+    circ._subsystem_trunc_dims = subsystem_trunc_dims
+    circ._hierarchical_diagonalization = true
+
+    # Symbolic decomposition
+    subsys_H, interactions = _decompose_sym_hamiltonian(circ, system_hierarchy)
+    circ._subsystem_sym_hamiltonians = subsys_H
+    circ._subsystem_interactions_sym = interactions
+
+    # Numerical hierarchical diagonalization (reuse existing function)
+    hs = hierarchical_diag(circ;
+        system_hierarchy=system_hierarchy,
+        subsystem_trunc_dims=subsystem_trunc_dims)
+    circ._hilbert_space = hs
+    circ._subsystems = SubCircuit[s for s in hs.subsystems]
+
+    return circ
 end
 
 # ── Symbolic accessors ──────────────────────────────────────────────────────
 
-"""Return the symbolic Hamiltonian expression (in mode variables)."""
-sym_hamiltonian(circ::Circuit) = circ.mode_hamiltonian_symbolic
+"""
+    sym_hamiltonian(circ::Circuit; subsystem_index=nothing)
+
+Return the symbolic Hamiltonian expression (in mode variables).
+
+Without `subsystem_index`: returns the full-circuit symbolic Hamiltonian.
+With `subsystem_index=i` (1-based): returns the symbolic Hamiltonian for
+subsystem `i` only, as decomposed by [`configure!`](@ref).
+"""
+function sym_hamiltonian(circ::Circuit; subsystem_index::Union{Nothing,Int}=nothing)
+    if subsystem_index === nothing
+        return circ.mode_hamiltonian_symbolic
+    end
+    circ._hierarchical_diagonalization ||
+        error("subsystem_index requires configure!() to be called first")
+    circ._subsystem_sym_hamiltonians === nothing &&
+        error("Symbolic decomposition not available. Call configure!() first.")
+    haskey(circ._subsystem_sym_hamiltonians, subsystem_index) ||
+        error("subsystem_index=$subsystem_index is out of range. " *
+              "Valid indices: $(sort(collect(keys(circ._subsystem_sym_hamiltonians))))")
+    return circ._subsystem_sym_hamiltonians[subsystem_index]
+end
 
 """Return the symbolic Hamiltonian expression (in node variables)."""
 sym_hamiltonian_node(circ::Circuit) = circ.symbolic_circuit.hamiltonian_symbolic
+
+"""
+    sym_interaction(circ::Circuit; subsystem_indices::Tuple{Int,Int})
+
+Return the symbolic interaction (coupling) terms between two subsystems.
+
+`subsystem_indices` is a tuple of two 1-based subsystem indices, e.g., `(1, 2)`.
+Returns a `Symbolics.Num` expression containing all symbolic terms that involve
+mode variables from both specified subsystems.
+
+Requires [`configure!`](@ref) to have been called first.
+"""
+function sym_interaction(circ::Circuit; subsystem_indices::Tuple{Int,Int})
+    circ._hierarchical_diagonalization ||
+        error("sym_interaction requires configure!() to be called first")
+    circ._subsystem_interactions_sym === nothing &&
+        error("Symbolic decomposition not available. Call configure!() first.")
+    key = Set(subsystem_indices)
+    return get(circ._subsystem_interactions_sym, key, Num(0))
+end
 
 """Return `(T, var_categories)` — the variable transformation from node to mode basis."""
 variable_transformation(circ::Circuit) = (circ.transformation_matrix, circ.var_categories)

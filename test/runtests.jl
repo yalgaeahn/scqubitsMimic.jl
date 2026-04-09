@@ -49,20 +49,23 @@ using ScQubitsMimic
         osc = Oscillator(E_osc=6.0, truncated_dim=10)
         @test hilbertdim(osc) == 10
         evals = eigenvals(osc; evals_count=5)
-        # H = E_osc * (n + 0.5), so E_k = E_osc * (k + 0.5)
+        # H = E_osc * n, so E_k = E_osc * k
         for k in 0:4
-            @test evals[k + 1] ≈ 6.0 * (k + 0.5) rtol=1e-10
+            @test evals[k + 1] ≈ 6.0 * k rtol=1e-10
         end
     end
 
     @testset "KerrOscillator" begin
-        kosc = KerrOscillator(E_osc=6.0, K=-0.2, truncated_dim=10)
+        kosc = KerrOscillator(E_osc=6.0, K=0.2, truncated_dim=10)
         evals = eigenvals(kosc; evals_count=4)
-        # H = E_osc * n + K/2 * n*(n-1), so E_n = E_osc * n + K/2 * n*(n-1)
+        # H = E_osc * n - K * n*(n-1), so E_n = (E_osc + K) * n - K * n^2
         for n in 0:3
-            expected = 6.0 * n + (-0.2 / 2) * n * (n - 1)
+            expected = (6.0 + 0.2) * n - 0.2 * n^2
             @test evals[n + 1] ≈ expected rtol=1e-10
         end
+        ω01 = evals[2] - evals[1]
+        ω12 = evals[3] - evals[2]
+        @test ω12 < ω01
     end
 
     @testset "Circuit graph parsing" begin
@@ -189,6 +192,7 @@ branches:
   - [JJ, 0, 3, EJ=4.6, EC=0.1]
   - [JJ, 3, 0, EJ=10.0, EC=0.1]
   - [C, 3, 0, EC=0.2]
+  - [C, 1, 3, EC=500.0]
 """
         circ = Circuit(desc; ncut=6)
 
@@ -201,6 +205,19 @@ branches:
             @test flux_map[flux].closure_branch == circ.symbolic_circuit.superconducting_closure_branches[k]
             @test flux_map[flux].loop == circ.symbolic_circuit.superconducting_loops[k]
         end
+
+        cg = parse_circuit(desc)
+        tree = find_spanning_tree(cg)
+        closure = find_closure_branches(cg, tree)
+        closure_sc, loops_sc = find_superconducting_loops(cg)
+        floops = find_fundamental_loops(cg, tree)
+
+        @test tree == [3, 4, 8]
+        @test closure == [1, 2, 5, 6, 7, 9, 10, 11, 12]
+        @test closure_sc == [2, 6, 10]
+        @test loops_sc == [[(2, 1), (1, 1)], [(6, 1), (5, 1)], [(10, 1), (9, 1)]]
+        @test floops[end] == [(12, 1), (4, -1), (8, -1)]
+
         @test occursin("Φ1", string(sym_hamiltonian(circ)))
         @test occursin("Φ1", string(sym_hamiltonian_node(circ)))
         @test !occursin("Φext", string(sym_hamiltonian(circ)))
@@ -788,6 +805,7 @@ branches:
   - [JJ, 0, 3, EJ=4.6, EC=0.1]
   - [JJ, 3, 0, EJ=10.0, EC=0.1]
   - [C, 3, 0, EC=0.2]
+  - [C, 1, 3, EC=500.0]
 """
         flux_vals = [-π, 0.0, π]
 
@@ -1071,6 +1089,243 @@ branches:
         C_expected = 1 / (8 * 0.3) + 1 / (8 * 0.5)
         c = Sym.coeff(Sym.expand(L_node), sc.node_dot_vars[1]^2)
         @test Float64(Sym.value(c)) ≈ C_expected / 2 rtol=1e-10
+    end
+
+    # ── Hierarchical analysis APIs (configure!, sym_hamiltonian, sym_interaction) ─
+
+    @testset "configure! stores hierarchy state" begin
+        desc = """
+branches:
+  - [JJ, 0, 1, EJ=10.0, EC=0.3]
+  - [JJ, 0, 2, EJ=8.0, EC=0.4]
+  - [C, 1, 2, EC=0.1]
+"""
+        circ = Circuit(desc; ncut=10)
+        configure!(circ; system_hierarchy=[[1],[2]], subsystem_trunc_dims=Dict(1=>10, 2=>10))
+
+        @test circ._hierarchical_diagonalization == true
+        @test circ._hilbert_space isa HilbertSpace
+        @test circ._subsystems !== nothing
+        @test length(circ._subsystems) == 2
+        @test all(sub -> sub isa SubCircuit, circ._subsystems)
+        @test circ._subsystem_sym_hamiltonians !== nothing
+        @test circ._subsystem_interactions_sym !== nothing
+    end
+
+    @testset "sym_hamiltonian with subsystem_index" begin
+        Sym = ScQubitsMimic.Symbolics
+
+        desc = """
+branches:
+  - [JJ, 0, 1, EJ=10.0, EC=0.3]
+  - [JJ, 0, 2, EJ=8.0, EC=0.4]
+  - [C, 1, 2, EC=0.1]
+"""
+        circ = Circuit(desc; ncut=10)
+
+        # Without configure!, subsystem_index should error
+        @test_throws ErrorException sym_hamiltonian(circ; subsystem_index=1)
+
+        configure!(circ; system_hierarchy=[[1],[2]], subsystem_trunc_dims=Dict(1=>10, 2=>10))
+
+        # Full Hamiltonian still works
+        H_full = sym_hamiltonian(circ)
+        @test H_full isa Sym.Num
+
+        # Subsystem Hamiltonians
+        H1 = sym_hamiltonian(circ; subsystem_index=1)
+        H2 = sym_hamiltonian(circ; subsystem_index=2)
+        @test H1 isa Sym.Num
+        @test H2 isa Sym.Num
+
+        # H1 should reference mode-1 variables but NOT mode-2 variables
+        h1_vars = Sym.get_variables(H1)
+        ref_θ = [Sym.variable(:θ, i) for i in 1:2]
+        ref_nθ = [Sym.variable(:nθ, i) for i in 1:2]
+        has_mode(vars, i) = any(v -> isequal(v, ref_θ[i]) || isequal(v, ref_nθ[i]), vars)
+        @test has_mode(h1_vars, 1)
+        @test !has_mode(h1_vars, 2)
+
+        # H2 should reference mode-2 variables but NOT mode-1 variables
+        h2_vars = Sym.get_variables(H2)
+        @test has_mode(h2_vars, 2)
+        @test !has_mode(h2_vars, 1)
+
+        # Invalid subsystem_index
+        @test_throws ErrorException sym_hamiltonian(circ; subsystem_index=3)
+    end
+
+    @testset "sym_interaction returns nontrivial coupling" begin
+        Sym = ScQubitsMimic.Symbolics
+
+        desc = """
+branches:
+  - [JJ, 0, 1, EJ=10.0, EC=0.3]
+  - [JJ, 0, 2, EJ=8.0, EC=0.4]
+  - [C, 1, 2, EC=0.1]
+"""
+        circ = Circuit(desc; ncut=10)
+
+        # Without configure!, should error
+        @test_throws ErrorException sym_interaction(circ; subsystem_indices=(1, 2))
+
+        configure!(circ; system_hierarchy=[[1],[2]], subsystem_trunc_dims=Dict(1=>10, 2=>10))
+
+        H_int = sym_interaction(circ; subsystem_indices=(1, 2))
+        @test H_int isa Sym.Num
+
+        # Should be nontrivial (not zero) for capacitively coupled circuit
+        @test !isequal(H_int, Sym.Num(0))
+
+        # Should contain cross-mode terms (both mode 1 and mode 2 variables)
+        int_vars = Sym.get_variables(H_int)
+        ref_θ = [Sym.variable(:θ, i) for i in 1:2]
+        ref_nθ = [Sym.variable(:nθ, i) for i in 1:2]
+        has_mode(vars, i) = any(v -> isequal(v, ref_θ[i]) || isequal(v, ref_nθ[i]), vars)
+        @test has_mode(int_vars, 1)
+        @test has_mode(int_vars, 2)
+
+        # Symmetric: (1,2) and (2,1) should give same result
+        H_int_rev = sym_interaction(circ; subsystem_indices=(2, 1))
+        @test isequal(H_int, H_int_rev)
+    end
+
+    @testset "Symbolic decomposition completeness" begin
+        Sym = ScQubitsMimic.Symbolics
+
+        desc = """
+branches:
+  - [JJ, 0, 1, EJ=10.0, EC=0.3]
+  - [JJ, 0, 2, EJ=8.0, EC=0.4]
+  - [C, 1, 2, EC=0.1]
+"""
+        circ = Circuit(desc; ncut=10)
+        configure!(circ; system_hierarchy=[[1],[2]], subsystem_trunc_dims=Dict(1=>10, 2=>10))
+
+        H_full = sym_hamiltonian(circ)
+        H1 = sym_hamiltonian(circ; subsystem_index=1)
+        H2 = sym_hamiltonian(circ; subsystem_index=2)
+        H_int = sym_interaction(circ; subsystem_indices=(1, 2))
+
+        # H1 + H2 + H_int should equal H_full (symbolic difference simplifies to 0)
+        diff = Sym.simplify(Sym.expand(H1 + H2 + H_int - H_full))
+        @test isequal(diff, Sym.Num(0)) || isequal(diff, 0)
+    end
+
+    @testset "Yan-style 3-loop coupler with configure!" begin
+        desc = """
+branches:
+  - [JJ, 0, 1, EJ=4.5, EC=0.1]
+  - [JJ, 1, 0, EJ=10.5, EC=0.1]
+  - [C, 1, 0, EC=0.2]
+  - [C, 1, 2, EC=5.0]
+  - [JJ, 0, 2, EJ=30.0, EC=0.1]
+  - [JJ, 2, 0, EJ=20.0, EC=0.1]
+  - [C, 2, 0, EC=0.1]
+  - [C, 2, 3, EC=5.0]
+  - [JJ, 0, 3, EJ=4.6, EC=0.1]
+  - [JJ, 3, 0, EJ=10.0, EC=0.1]
+  - [C, 3, 0, EC=0.2]
+  - [C, 1, 3, EC=500.0]
+"""
+        circ = Circuit(desc; ncut=6)
+        set_param!(circ, :Φ1, 0.0)
+        set_param!(circ, :Φ2, 0.0)
+        set_param!(circ, :Φ3, 0.0)
+
+        configure!(circ;
+            system_hierarchy=[[1], [2], [3]],
+            subsystem_trunc_dims=Dict(1=>3, 2=>3, 3=>3))
+
+        # 3 subsystems
+        @test length(circ._subsystems) == 3
+        @test all(sub -> sub isa SubCircuit, circ._subsystems)
+        @test circ._hilbert_space isa HilbertSpace
+
+        # Each subsystem has its own symbolic Hamiltonian
+        for i in 1:3
+            Hi = sym_hamiltonian(circ; subsystem_index=i)
+            @test Hi isa ScQubitsMimic.Symbolics.Num
+        end
+
+        # Interactions between all pairs should exist (capacitive coupling)
+        for (i, j) in [(1,2), (2,3), (1,3)]
+            H_int = sym_interaction(circ; subsystem_indices=(i, j))
+            @test H_int isa ScQubitsMimic.Symbolics.Num
+            # At least some pairs should have nontrivial coupling
+        end
+
+        # Check that (1,2) and (2,3) have nontrivial coupling (direct capacitive)
+        Sym = ScQubitsMimic.Symbolics
+        interaction_strength(expr) = begin
+            coeff = split(replace(string(expr), " " => ""), "nθ")[1]
+            abs(parse(Float64, coeff))
+        end
+
+        H12 = sym_interaction(circ; subsystem_indices=(1, 2))
+        H23 = sym_interaction(circ; subsystem_indices=(2, 3))
+        H13 = sym_interaction(circ; subsystem_indices=(1, 3))
+
+        @test !isequal(H12, Sym.Num(0))
+        @test !isequal(H23, Sym.Num(0))
+        @test !isequal(H13, Sym.Num(0))
+        @test interaction_strength(H13) > 1e-4
+        @test interaction_strength(H12) > 10 * interaction_strength(H13)
+        @test interaction_strength(H23) > 10 * interaction_strength(H13)
+    end
+
+    @testset "invalidate_cache! clears numerical but keeps symbolic" begin
+        desc = """
+branches:
+  - [JJ, 0, 1, EJ=10.0, EC=0.3]
+  - [JJ, 0, 2, EJ=8.0, EC=0.4]
+  - [C, 1, 2, EC=0.1]
+"""
+        circ = Circuit(desc; ncut=10)
+        configure!(circ; system_hierarchy=[[1],[2]], subsystem_trunc_dims=Dict(1=>10, 2=>10))
+
+        @test circ._hilbert_space !== nothing
+        @test circ._subsystem_sym_hamiltonians !== nothing
+
+        # After parameter change, numerical results cleared but symbolic stays
+        set_param!(circ, :EJ, 12.0)
+        @test circ._hilbert_space === nothing
+        @test circ._subsystems === nothing
+        @test circ._subsystem_sym_hamiltonians !== nothing  # symbolic still valid
+        @test circ._hierarchical_diagonalization == true     # flag still set
+    end
+
+    @testset "Multi-mode subsystem grouping" begin
+        Sym = ScQubitsMimic.Symbolics
+
+        # 3-mode circuit with grouping [[1,2],[3]]
+        desc = """
+branches:
+  - [JJ, 0, 1, EJ=10.0, EC=0.3]
+  - [JJ, 0, 2, EJ=8.0, EC=0.4]
+  - [JJ, 0, 3, EJ=6.0, EC=0.5]
+  - [C, 1, 2, EC=0.1]
+  - [C, 2, 3, EC=0.15]
+"""
+        circ = Circuit(desc; ncut=5)
+        configure!(circ; system_hierarchy=[[1,2],[3]],
+                  subsystem_trunc_dims=Dict(1=>20, 2=>10))
+
+        H1 = sym_hamiltonian(circ; subsystem_index=1)
+        H2 = sym_hamiltonian(circ; subsystem_index=2)
+
+        # H1 should contain modes 1 and/or 2 but not mode 3
+        h1_vars = Sym.get_variables(H1)
+        ref_θ = [Sym.variable(:θ, i) for i in 1:3]
+        ref_nθ = [Sym.variable(:nθ, i) for i in 1:3]
+        has_mode(vars, i) = any(v -> isequal(v, ref_θ[i]) || isequal(v, ref_nθ[i]), vars)
+        @test has_mode(h1_vars, 1) || has_mode(h1_vars, 2)
+        @test !has_mode(h1_vars, 3)
+
+        # H2 should contain mode 3 only
+        h2_vars = Sym.get_variables(H2)
+        @test has_mode(h2_vars, 3)
+        @test !has_mode(h2_vars, 1) && !has_mode(h2_vars, 2)
     end
 
 end
