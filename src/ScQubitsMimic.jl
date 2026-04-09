@@ -4,6 +4,7 @@ using LinearAlgebra
 using SparseArrays
 using QuantumToolbox
 using Symbolics
+using Latexify: latexify
 using Graphs
 
 # Core infrastructure
@@ -101,7 +102,7 @@ export HilbertSpace, InteractionTerm, ParameterSweep, HilbertSpaceSweep, Spectru
 export add_interaction!, add_operator!, diag!
 export generate_lookup!, dressed_index, bare_index,
        energy_by_dressed_index, energy_by_bare_index,
-       op_in_dressed_eigenbasis
+       op_in_dressed_eigenbasis, OVERLAP_THRESHOLD
 export chi_matrix, self_kerr, lamb_shift
 export effective_hamiltonian, exchange_coupling, avoided_crossing_coupling
 

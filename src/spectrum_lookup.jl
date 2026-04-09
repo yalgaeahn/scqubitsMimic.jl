@@ -4,13 +4,31 @@
 # The SpectrumLookup struct is defined in spectrum_data.jl (loaded early).
 # ──────────────────────────────────────────────────────────────────────────────
 
+"""Default overlap threshold (squared) for bare↔dressed assignment.
+
+A dressed state is only assigned to a bare state when
+`|⟨bare|dressed⟩|² > OVERLAP_THRESHOLD`.  Matches the scqubits default of 0.5.
 """
-    generate_lookup!(hs::HilbertSpace; evals_count=10)
+const OVERLAP_THRESHOLD = 0.5
+
+"""
+    generate_lookup!(hs::HilbertSpace; evals_count=10,
+                     overlap_threshold=OVERLAP_THRESHOLD)
 
 Diagonalize the full Hamiltonian and build bare ↔ dressed state mapping.
 Stores result in `hs.lookup`. Returns the `SpectrumLookup`.
+
+The assignment algorithm matches scqubits DE (Dressed Energy) ordering:
+dressed states are processed in ascending index order; each dressed state is
+assigned to the bare product state with the largest `|⟨bare|dressed⟩|`,
+provided `|overlap|² > overlap_threshold`. Once a bare state is claimed it
+cannot be reused.
+
+Set `overlap_threshold=0` to force assignment even for low overlaps (the
+previous default behavior).
 """
-function generate_lookup!(hs::HilbertSpace; evals_count::Int=10)
+function generate_lookup!(hs::HilbertSpace; evals_count::Int=10,
+                          overlap_threshold::Float64=OVERLAP_THRESHOLD)
     # Dressed eigensystem
     dressed_vals, dressed_vecs = eigensys(hs; evals_count=evals_count)
     n_dressed = length(dressed_vals)
@@ -31,7 +49,7 @@ function generate_lookup!(hs::HilbertSpace; evals_count::Int=10)
     # Build bare product states in the full Hilbert space
     # Product state |n1, n2, ...⟩ = |n1⟩ ⊗ |n2⟩ ⊗ ...
     total_dim = prod(sub_dims)
-    n_bare_states = total_dim  # all product states
+    n_bare_states = total_dim
 
     # Generate all multi-indices for bare states
     bare_indices = _generate_bare_indices(sub_dims)
@@ -52,30 +70,25 @@ function generate_lookup!(hs::HilbertSpace; evals_count::Int=10)
         end
     end
 
-    # Assignment: each dressed state maps to the bare state with max overlap
+    # Greedy assignment matching scqubits DE ordering:
+    # iterate dressed states in ascending index order (1, 2, 3, ...).
     bare_to_dressed = Dict{Tuple, Int}()
     dressed_to_bare = Dict{Int, Tuple}()
 
-    # Greedy assignment: for each dressed state, find best bare match
-    used_bare = Set{Int}()
-    # Sort dressed states by their max overlap (descending) for better matching
-    dress_order = sortperm([maximum(overlap[i, :]) for i in 1:n_dressed], rev=true)
+    # Work on a mutable copy so we can zero out assigned columns.
+    ov_work = copy(overlap)
 
-    for i in dress_order
-        # Find best unassigned bare state
-        best_j = 0
-        best_ov = -1.0
-        for j in 1:n_bare_states
-            if !(j in used_bare) && overlap[i, j] > best_ov
-                best_ov = overlap[i, j]
-                best_j = j
-            end
-        end
-        if best_j > 0
-            push!(used_bare, best_j)
-            bare_tup = Tuple(bare_indices[best_j])
-            bare_to_dressed[bare_tup] = i
-            dressed_to_bare[i] = bare_tup
+    for dressed_idx in 1:n_dressed
+        max_pos = argmax(@view ov_work[dressed_idx, :])
+        max_ov = sqrt(ov_work[dressed_idx, max_pos])  # |⟨bare|dressed⟩|
+
+        if max_ov^2 > overlap_threshold
+            # Claim this bare state (zero its column to prevent reuse)
+            ov_work[:, max_pos] .= 0.0
+
+            bare_tup = Tuple(bare_indices[max_pos])
+            bare_to_dressed[bare_tup] = dressed_idx
+            dressed_to_bare[dressed_idx] = bare_tup
         end
     end
 

@@ -55,7 +55,7 @@ mutable struct Circuit <: AbstractQuantumSystem
     # Types use Any/Vector to avoid forward-reference issues (SubCircuit, HilbertSpace
     # are defined in files loaded after quantization.jl)
     _system_hierarchy::Union{Nothing, Vector}
-    _subsystem_trunc_dims::Any                          # nothing or Dict
+    _subsystem_trunc_dims::Any                          # nothing or scqubits-style truncation list
     _subsystems::Union{Nothing, Vector}                 # Vector{SubCircuit} when set
     _hilbert_space::Any                                 # HilbertSpace when set
     _subsystem_sym_hamiltonians::Union{Nothing, Dict{Int, Num}}
@@ -161,19 +161,23 @@ end
     _decompose_sym_hamiltonian(circ::Circuit, system_hierarchy::Vector)
 
 Decompose `circ.mode_hamiltonian_symbolic` into per-subsystem Hamiltonians
-and inter-subsystem interaction terms based on which mode variables appear.
+and per-subsystem interaction terms, matching the scqubits sequential
+subtraction algorithm in `_sym_subsystem_hamiltonian_and_interactions`.
 
 Returns `(subsys_H, interactions)` where:
 - `subsys_H::Dict{Int, Num}` maps 1-based subsystem group index to its symbolic H
-- `interactions::Dict{Set{Int}, Num}` maps sets of group indices to symbolic coupling
+- `interactions::Dict{Int, Num}` maps 1-based subsystem group index to the
+  interaction terms first encountered when processing that subsystem (scqubits
+  stores interactions per-subsystem, not per-set).
+
+Additionally populates `interactions_by_set::Dict{Set{Int}, Num}` which is
+stored as a secondary index for the `sym_interaction` exact-set lookup.
 """
 function _decompose_sym_hamiltonian(circ::Circuit, system_hierarchy::Vector)
     n = circ.symbolic_circuit.graph.num_nodes
 
     # Build mode_index → group_index mapping (1-based groups)
     mode_to_group = Dict{Int, Int}()
-    # system_hierarchy is a flat list of lists, e.g., [[1], [2]] or [[1,3], [2]]
-    # Each element (at the top level for flat hierarchy) is a group
     flat_groups = _flatten_hierarchy_groups(system_hierarchy)
     for (gi, group) in enumerate(flat_groups)
         for mi in group
@@ -182,57 +186,132 @@ function _decompose_sym_hamiltonian(circ::Circuit, system_hierarchy::Vector)
     end
     n_groups = length(flat_groups)
 
-    # Build variable → mode_index lookup
+    # Build variable → mode_index lookup (operator symbols only: θ_i and nθ_i)
     var_to_mode = Dict{Any, Int}()
     for i in 1:n
         var_to_mode[Symbolics.unwrap(Symbolics.variable(:θ, i))] = i
         var_to_mode[Symbolics.unwrap(Symbolics.variable(:nθ, i))] = i
     end
 
-    # Initialize accumulators
-    subsys_H = Dict{Int, Num}(gi => Num(0) for gi in 1:n_groups)
-    interactions = Dict{Set{Int}, Num}()
+    # ── Helper: classify operator-variable groups for a single term ───────
+    # A variable is an "operator" if it maps to a mode via var_to_mode.
+    # All other symbols (external fluxes, offset charges, branch parameters)
+    # are ignored during classification.
+    function _term_groups(raw_term)
+        term = Symbolics.wrap(raw_term)
+        vars = Symbolics.get_variables(term)
+        groups = Set{Int}()
+        for v in vars
+            vu = Symbolics.unwrap(v)
+            if haskey(var_to_mode, vu)
+                mi = var_to_mode[vu]
+                haskey(mode_to_group, mi) && push!(groups, mode_to_group[mi])
+            end
+        end
+        return groups
+    end
 
-    # Expand the Hamiltonian to separate additive terms
+    # ── Step 1: separate constant terms (no operator variables) ───────────
     H_expanded = Symbolics.expand(circ.mode_hamiltonian_symbolic)
     H_unwrapped = Symbolics.unwrap(H_expanded)
-
-    # Extract additive terms
-    terms = if Symbolics.iscall(H_unwrapped) && Symbolics.operation(H_unwrapped) === (+)
+    all_terms = if Symbolics.iscall(H_unwrapped) && Symbolics.operation(H_unwrapped) === (+)
         Symbolics.arguments(H_unwrapped)
     else
         [H_unwrapped]
     end
 
-    for raw_term in terms
-        term = Symbolics.wrap(raw_term)
-        vars = Symbolics.get_variables(term)
-
-        # Find which subsystem groups are involved
-        involved_groups = Set{Int}()
-        for v in vars
-            vu = Symbolics.unwrap(v)
-            if haskey(var_to_mode, vu)
-                mi = var_to_mode[vu]
-                if haskey(mode_to_group, mi)
-                    push!(involved_groups, mode_to_group[mi])
-                end
-            end
-        end
-
-        if length(involved_groups) == 0
-            # Constant term (no mode variables) → assign to group 1
-            subsys_H[1] = subsys_H[1] + term
-        elseif length(involved_groups) == 1
-            g = only(involved_groups)
-            subsys_H[g] = subsys_H[g] + term
+    constants = Num[]
+    op_terms  = Num[]
+    for raw_term in all_terms
+        groups = _term_groups(raw_term)
+        if isempty(groups)
+            push!(constants, Symbolics.wrap(raw_term))
         else
-            key = Set(involved_groups)
-            interactions[key] = get(interactions, key, Num(0)) + term
+            push!(op_terms, Symbolics.wrap(raw_term))
         end
     end
 
-    return (subsys_H, interactions)
+    # Running Hamiltonian (without constants — they are distributed later).
+    running_H = isempty(op_terms) ? Num(0) : reduce(+, op_terms)
+
+    # ── Step 2: sequential subsystem extraction (scqubits algorithm) ──────
+    subsys_H   = Dict{Int, Num}(gi => Num(0) for gi in 1:n_groups)
+    int_per_subsys = Dict{Int, Num}(gi => Num(0) for gi in 1:n_groups)
+
+    for gi in 1:n_groups
+        subsys_modes = Set(flat_groups[gi])
+
+        # Expand current running Hamiltonian to additive terms
+        rH = Symbolics.expand(running_H)
+        rH_unwrapped = Symbolics.unwrap(rH)
+        terms_now = if Symbolics.iscall(rH_unwrapped) && Symbolics.operation(rH_unwrapped) === (+)
+            Symbolics.arguments(rH_unwrapped)
+        else
+            [rH_unwrapped]
+        end
+
+        H_sys = Num(0)
+        H_int = Num(0)
+        for raw_term in terms_now
+            groups = _term_groups(raw_term)
+            term = Symbolics.wrap(raw_term)
+            # Pure subsystem term: all operator vars are within this subsystem
+            if !isempty(groups) && issubset(groups, Set([gi]))
+                H_sys = H_sys + term
+            # Interaction term: has operators in this subsystem AND outside
+            elseif !isempty(intersect(groups, Set([gi]))) && !issubset(groups, Set([gi]))
+                H_int = H_int + term
+            end
+        end
+
+        # Distribute constants that share symbolic variables with H_sys
+        sys_vars = Set(Symbolics.unwrap.(Symbolics.get_variables(H_sys)))
+        owned_consts = Num[]
+        remaining_consts = Num[]
+        for c in constants
+            c_vars = Set(Symbolics.unwrap.(Symbolics.get_variables(c)))
+            if !isempty(intersect(c_vars, sys_vars))
+                push!(owned_consts, c)
+            else
+                push!(remaining_consts, c)
+            end
+        end
+        constants = remaining_consts
+        for c in owned_consts
+            H_sys = H_sys + c
+        end
+
+        subsys_H[gi]       = H_sys
+        int_per_subsys[gi] = H_int
+
+        # Subtract processed terms from running Hamiltonian
+        running_H = Symbolics.expand(running_H - H_sys - H_int)
+    end
+
+    # Leftover constants → first subsystem (scqubits convention)
+    for c in constants
+        subsys_H[1] = subsys_H[1] + c
+    end
+
+    # ── Step 3: build secondary index by subsystem-set for sym_interaction ─
+    interactions_by_set = Dict{Set{Int}, Num}()
+    for gi in 1:n_groups
+        int_expr = Symbolics.expand(int_per_subsys[gi])
+        int_unwrapped = Symbolics.unwrap(int_expr)
+        int_terms = if Symbolics.iscall(int_unwrapped) && Symbolics.operation(int_unwrapped) === (+)
+            Symbolics.arguments(int_unwrapped)
+        else
+            [int_unwrapped]
+        end
+        for raw_term in int_terms
+            groups = _term_groups(raw_term)
+            isempty(groups) && continue
+            key = Set(groups)
+            interactions_by_set[key] = get(interactions_by_set, key, Num(0)) + Symbolics.wrap(raw_term)
+        end
+    end
+
+    return (subsys_H, interactions_by_set)
 end
 
 """Extract flat list of leaf mode-index groups from a system_hierarchy specification."""
@@ -265,7 +344,7 @@ function _collect_all_modes(v::Vector)
 end
 
 """
-    configure!(circ::Circuit; system_hierarchy, subsystem_trunc_dims=nothing)
+    configure!(circ::Circuit; system_hierarchy, subsystem_trunc_dims)
 
 Configure hierarchical diagonalization for the circuit, storing hierarchy
 metadata and computing both symbolic and numerical decompositions.
@@ -273,7 +352,7 @@ metadata and computing both symbolic and numerical decompositions.
 This is the Julia equivalent of `circ.configure(...)` in Python scqubits.
 After calling, the circuit provides:
 - `sym_hamiltonian(circ; subsystem_index=i)` for per-subsystem symbolic Hamiltonians
-- `sym_interaction(circ; subsystem_indices=(i,j))` for symbolic interaction terms
+- `sym_interaction(circ; subsystem_indices=(i,j,...))` for symbolic interaction terms
 - `circ._subsystems` for the diagonalized subsystem objects
 - `circ._hilbert_space` for the diagonalized composite system
 
@@ -281,19 +360,22 @@ Uses 1-based indexing (Julia convention) for subsystem indices.
 
 # Example
 ```julia
-configure!(circ; system_hierarchy=[[1],[2]], subsystem_trunc_dims=Dict(1=>10, 2=>10))
+configure!(circ; system_hierarchy=[[1], [2]], subsystem_trunc_dims=[10, 10])
 sym_hamiltonian(circ; subsystem_index=1)      # symbolic H for subsystem 1
-sym_interaction(circ; subsystem_indices=(1,2)) # coupling between subsystems 1 and 2
+sym_interaction(circ; subsystem_indices=(1, 2), return_expr=true) # coupling between subsystems 1 and 2
 ```
 """
 function configure!(circ::Circuit; system_hierarchy, subsystem_trunc_dims=nothing)
-    resolved_trunc_dims = subsystem_trunc_dims === nothing ?
-                          truncation_template(system_hierarchy) :
-                          subsystem_trunc_dims
+    subsystem_trunc_dims === nothing && throw(ArgumentError(
+        "subsystem_trunc_dims is required in strict parity mode. " *
+        "Use truncation_template(system_hierarchy) as a starting point."
+    ))
+    # Validate truncation shape up front (throws on mismatch).
+    _ = _subsystem_trunc_dims_to_path_dict(system_hierarchy, subsystem_trunc_dims)
 
     # Store configuration
     circ._system_hierarchy = system_hierarchy
-    circ._subsystem_trunc_dims = resolved_trunc_dims
+    circ._subsystem_trunc_dims = deepcopy(subsystem_trunc_dims)
     circ._hierarchical_diagonalization = true
 
     # Symbolic decomposition
@@ -304,7 +386,7 @@ function configure!(circ::Circuit; system_hierarchy, subsystem_trunc_dims=nothin
     # Numerical hierarchical diagonalization (reuse existing function)
     hs = hierarchical_diag(circ;
         system_hierarchy=system_hierarchy,
-        subsystem_trunc_dims=resolved_trunc_dims)
+        subsystem_trunc_dims=subsystem_trunc_dims)
     circ._hilbert_space = hs
     circ._subsystems = SubCircuit[s for s in hs.subsystems]
 
@@ -340,23 +422,103 @@ end
 sym_hamiltonian_node(circ::Circuit) = circ.symbolic_circuit.hamiltonian_symbolic
 
 """
-    sym_interaction(circ::Circuit; subsystem_indices::Tuple{Int,Int})
+    sym_interaction(circ::Circuit;
+                    subsystem_indices::Tuple{Vararg{Int}},
+                    float_round=6,
+                    print_latex=false,
+                    return_expr=false)
 
-Return the symbolic interaction (coupling) terms between two subsystems.
+Return or print symbolic interaction terms for an arbitrary set of subsystems.
 
-`subsystem_indices` is a tuple of two 1-based subsystem indices, e.g., `(1, 2)`.
-Returns a `Symbolics.Num` expression containing all symbolic terms that involve
-mode variables from both specified subsystems.
+`subsystem_indices` follows scqubits semantics: interaction terms are included
+only when their involved subsystem-index set exactly matches the requested set.
+Ordering is ignored, so `(1,2,3)` and `(3,1,2)` are equivalent.
+
+# Keywords
+- `float_round::Int=6` — round floating-point coefficients to this many
+  decimal places in the returned/printed expression (matches scqubits
+  `_make_expr_human_readable`).
+- `print_latex::Bool=false` — additionally print LaTeX representation.
+- `return_expr::Bool=false` — if `true`, suppress printing and return the
+  expression. **Note:** the scqubits default is `False` (print mode); we match
+  that here.
 
 Requires [`configure!`](@ref) to have been called first.
 """
-function sym_interaction(circ::Circuit; subsystem_indices::Tuple{Int,Int})
+function sym_interaction(circ::Circuit;
+                         subsystem_indices::Tuple{Vararg{Int}},
+                         float_round::Int=6,
+                         print_latex::Bool=false,
+                         return_expr::Bool=false)
     circ._hierarchical_diagonalization ||
         error("sym_interaction requires configure!() to be called first")
     circ._subsystem_interactions_sym === nothing &&
         error("Symbolic decomposition not available. Call configure!() first.")
-    key = Set(subsystem_indices)
-    return get(circ._subsystem_interactions_sym, key, Num(0))
+    unique_subsystems = sort(unique(collect(subsystem_indices)))
+    length(unique_subsystems) >= 2 || throw(ArgumentError(
+        "subsystem_indices must contain at least two subsystem indices."
+    ))
+    key = Set(unique_subsystems)
+    expr = get(circ._subsystem_interactions_sym, key, Num(0))
+
+    if return_expr
+        # Return the raw symbolic expression (no rounding / flux rewriting)
+        # so it stays compatible with symbolic manipulation and completeness
+        # checks (H1 + H2 + H_int == H_full).
+        return expr
+    end
+
+    # For display, apply human-readable transformations matching scqubits.
+    display_expr = _round_symbolic_floats(expr, float_round)
+    display_expr = _humanize_external_fluxes(circ, display_expr)
+
+    if print_latex
+        println(latexify(display_expr))
+    end
+    println(display_expr)
+    return nothing
+end
+
+"""Round floating-point literal coefficients in a Symbolics expression."""
+function _round_symbolic_floats(expr::Num, digits::Int)
+    subs = Pair{Num, Num}[]
+    _find_float_leaves!(subs, Symbolics.unwrap(expr), digits, Set{UInt}())
+    isempty(subs) && return expr
+    result = expr
+    for (old, new) in subs
+        result = Symbolics.substitute(result, Dict(old => new))
+    end
+    return result
+end
+
+function _find_float_leaves!(subs, t, digits, visited)
+    id = objectid(t)
+    id in visited && return
+    push!(visited, id)
+    if !Symbolics.iscall(t)
+        v = Symbolics.value(t)
+        if v isa AbstractFloat
+            rounded = round(v; digits=digits)
+            if rounded != v
+                push!(subs, Symbolics.wrap(t) => Num(rounded))
+            end
+        end
+        return
+    end
+    for a in Symbolics.arguments(t)
+        _find_float_leaves!(subs, a, digits, visited)
+    end
+end
+
+"""Replace external flux symbols with `Φi/(2π)` form in a symbolic expression."""
+function _humanize_external_fluxes(circ::Circuit, expr::Num)
+    sc = circ.symbolic_circuit
+    isempty(sc.external_fluxes) && return expr
+    subs = Dict{Num, Num}()
+    for flux in sc.external_fluxes
+        subs[flux] = flux / (2π)
+    end
+    return Symbolics.substitute(expr, subs)
 end
 
 """Return `(T, var_categories)` — the variable transformation from node to mode basis."""

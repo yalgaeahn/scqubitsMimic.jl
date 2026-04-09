@@ -13,20 +13,29 @@ Build a projected effective Hamiltonian for a configured circuit.
 
 The circuit must have been configured via [`configure!`](@ref). Internally, the
 configured hierarchical `HilbertSpace` is reused (or rebuilt if parameter
-changes invalidated the numerical cache). The resulting effective Hamiltonian is
-expressed in the bare product basis selected by `projection_dims` or the
-explicit `basis_labels`.
+changes invalidated the numerical cache).
+
+The effective Hamiltonian is the restriction of the full dressed Hamiltonian to
+the selected bare product-state subspace:
+
+    H_eff[i,k] = sum_j  E_j  <bare_i|dressed_j> <dressed_j|bare_k>
+
+where the sum runs over **all** computed dressed eigenstates, not only those
+corresponding to the selected bare labels. This ensures that virtual
+contributions from non-selected states are included.
 
 Returns a named tuple containing:
 - `basis_labels`
-- `dressed_indices`
-- `dressed_energies`
-- `H_full_eff`
-- `H_bare_eff`
-- `H_int_eff`
+- `dressed_indices`  — dressed indices corresponding to the selected bare labels
+- `dressed_energies` — dressed energies for those indices
+- `overlap_matrix`   — rectangular (n_bare × n_dressed) projection matrix
+- `H_full_eff`       — full effective Hamiltonian in the bare subspace
+- `H_bare_eff`       — diagonal bare-energy Hamiltonian
+- `H_int_eff`        — interaction piece: `H_full_eff - H_bare_eff`
 - `projection_dims`
 - `subsystem_trunc_dims`
 - `pauli_terms` for all-2-level projections when `decompose_pauli=true`
+  (decomposed from `H_int_eff`, not `H_full_eff`)
 """
 function effective_hamiltonian(circ::Circuit;
                                projection_dims=(2, 2, 2),
@@ -40,18 +49,15 @@ function effective_hamiltonian(circ::Circuit;
                                                              sub_dims)
 
     lookup_evals = isnothing(evals_count) ? hilbertdim(hs) : evals_count
-    generate_lookup!(hs; evals_count=lookup_evals)
+    generate_lookup!(hs; evals_count=lookup_evals, overlap_threshold=0.0)
 
     bare_index_map = _bare_basis_index_map(sub_dims)
-    selected_indices = Int[]
+    selected_bare_indices = Int[]
     for label in labels
         haskey(bare_index_map, label) || error(
             "Bare label $label is out of range for subsystem dimensions $sub_dims.")
-        push!(selected_indices, bare_index_map[label])
+        push!(selected_bare_indices, bare_index_map[label])
     end
-
-    H_full = Matrix{ComplexF64}(hamiltonian(hs).data[selected_indices, selected_indices])
-    H_full = _hermitize(H_full)
 
     bare_evals = [eigenvals(s; evals_count=hilbertdim(s)) for s in hs.subsystems]
     bare_energies = ComplexF64[
@@ -60,21 +66,41 @@ function effective_hamiltonian(circ::Circuit;
         for label in labels
     ]
     H_bare = Matrix(Diagonal(bare_energies))
-    H_int = _hermitize(H_full - H_bare)
-
     dressed_indices = Int[dressed_index(hs, label...) for label in labels]
     dressed_energies = Float64[energy_by_bare_index(hs, label...) for label in labels]
 
+    # Build rectangular overlap matrix: P[i, j] = <bare_i | dressed_j>
+    # where i runs over the selected bare indices and j over ALL dressed states.
+    dressed_vecs = hs.lookup.dressed_evecs
+    n_bare = length(labels)
+    n_dressed = size(dressed_vecs, 2)
+    P = Matrix{ComplexF64}(undef, n_bare, n_dressed)
+    for j in 1:n_dressed
+        P[:, j] = dressed_vecs[selected_bare_indices, j]
+    end
+
+    # H_full_eff = P * diag(all_dressed_energies) * P'
+    # This sums over ALL dressed states, giving the exact restriction of H to
+    # the selected bare subspace.
+    all_dressed_energies = ComplexF64.(hs.lookup.dressed_evals)
+    H_full = _hermitize(P * (all_dressed_energies .* P') )
+    H_int = _hermitize(H_full - H_bare)
+
     pauli_terms = if decompose_pauli && all(==(2), resolved_projection_dims)
-        _pauli_decomposition(H_full)
+        _pauli_decomposition(H_int)
     else
         nothing
     end
+
+    # Also provide the square sub-overlap for the selected dressed states only
+    # (useful for diagnostics — when this is near-unitary, the projection is clean).
+    overlap_selected = P[:, dressed_indices]
 
     return (
         basis_labels=labels,
         dressed_indices=dressed_indices,
         dressed_energies=dressed_energies,
+        overlap_matrix=overlap_selected,
         H_full_eff=H_full,
         H_bare_eff=H_bare,
         H_int_eff=H_int,
@@ -137,7 +163,7 @@ function avoided_crossing_coupling(circ::Circuit;
         for (idx, val) in enumerate(param_vals)
             set_param!(circ, sweep_param, val)
             hs = _ensure_configured_hilbert_space!(circ)
-            generate_lookup!(hs; evals_count=evals_count)
+            generate_lookup!(hs; evals_count=evals_count, overlap_threshold=0.0)
             tracked_a[idx] = energy_by_bare_index(hs, state_a...)
             tracked_b[idx] = energy_by_bare_index(hs, state_b...)
         end
@@ -161,17 +187,15 @@ function avoided_crossing_coupling(circ::Circuit;
     )
 end
 
-# ── Internal helpers ─────────────────────────────────────────────────────────
+    # ── Internal helpers ─────────────────────────────────────────────────────────
 
 function _ensure_configured_hilbert_space!(circ::Circuit)
     circ._hierarchical_diagonalization ||
         error("This analysis requires configure!() to be called first")
     circ._system_hierarchy === nothing &&
         error("No stored system_hierarchy found. Call configure!() first.")
-
-    if circ._subsystem_trunc_dims === nothing
-        circ._subsystem_trunc_dims = truncation_template(circ._system_hierarchy)
-    end
+    circ._subsystem_trunc_dims === nothing &&
+        error("No stored subsystem_trunc_dims found. Call configure!() with explicit truncation.")
 
     if circ._hilbert_space === nothing
         hs = hierarchical_diag(circ;

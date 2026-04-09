@@ -535,7 +535,7 @@ branches:
         # Hierarchical: split into 2 groups
         hs = hierarchical_diag(circ;
             system_hierarchy=[[1], [2]],
-            subsystem_trunc_dims=Dict(1=>10, 2=>10))
+            subsystem_trunc_dims=[10, 10])
 
         @test length(hs.subsystems) == 2
         @test hs.subsystems[1] isa SubCircuit
@@ -550,7 +550,7 @@ branches:
 
         # Error on invalid hierarchy
         @test_throws ErrorException hierarchical_diag(circ;
-            system_hierarchy=[[1]], subsystem_trunc_dims=Dict(1=>5))
+            system_hierarchy=[[1]], subsystem_trunc_dims=[5])
     end
 
     @testset "Hierarchical diag: cross-group capacitive coupling (factor-of-2)" begin
@@ -569,7 +569,7 @@ branches:
 
         hs = hierarchical_diag(circ;
             system_hierarchy=[[1], [2]],
-            subsystem_trunc_dims=Dict(1=>nstates, 2=>nstates))
+            subsystem_trunc_dims=[nstates, nstates])
         evals_hier = eigenvals(hs; evals_count=6)
         evals_hier .-= evals_hier[1]
 
@@ -590,7 +590,7 @@ branches:
 
         hs = hierarchical_diag(circ;
             system_hierarchy=[[1], [2]],
-            subsystem_trunc_dims=Dict(1=>21, 2=>21))
+            subsystem_trunc_dims=[21, 21])
         evals_hier = eigenvals(hs; evals_count=6)
 
         @test evals_hier ≈ evals_full atol=1e-8
@@ -611,7 +611,7 @@ branches:
 
         hs = hierarchical_diag(circ;
             system_hierarchy=[[1], [2]],
-            subsystem_trunc_dims=Dict(1=>nstates, 2=>nstates))
+            subsystem_trunc_dims=[nstates, nstates])
         evals_hier = eigenvals(hs; evals_count=6)
         evals_hier .-= evals_hier[1]
 
@@ -621,7 +621,7 @@ branches:
         # With truncated dims (15 per mode), should still be close (<5%)
         hs_trunc = hierarchical_diag(circ;
             system_hierarchy=[[1], [2]],
-            subsystem_trunc_dims=Dict(1=>15, 2=>15))
+            subsystem_trunc_dims=[15, 15])
         evals_trunc = eigenvals(hs_trunc; evals_count=6)
         evals_trunc .-= evals_trunc[1]
         for i in 2:6
@@ -648,7 +648,7 @@ branches:
         # With generous truncation, should be within 10%
         hs = hierarchical_diag(circ;
             system_hierarchy=[[1], [2]],
-            subsystem_trunc_dims=Dict(1=>nstates_full, 2=>nstates_full))
+            subsystem_trunc_dims=[nstates_full, nstates_full])
         evals_hier = eigenvals(hs; evals_count=6)
         evals_hier .-= evals_hier[1]
 
@@ -668,7 +668,7 @@ branches:
 
         hs = hierarchical_diag(circ;
             system_hierarchy=[[1]],
-            subsystem_trunc_dims=Dict(1=>circ.cutoffs[1]))
+            subsystem_trunc_dims=[circ.cutoffs[1]])
         evals_hier = eigenvals(hs; evals_count=6)
 
         @test evals_hier ≈ evals_full atol=1e-8
@@ -709,7 +709,7 @@ branches:
         # Flat hierarchy: [[1], [2], [3]] with full truncation → exact
         hs_flat = hierarchical_diag(circ;
             system_hierarchy=[[1], [2], [3]],
-            subsystem_trunc_dims=Dict(1=>nstates, 2=>nstates, 3=>nstates))
+            subsystem_trunc_dims=[nstates, nstates, nstates])
         evals_flat = eigenvals(hs_flat; evals_count=6)
         evals_flat .-= evals_flat[1]
         @test evals_flat ≈ evals_full atol=1e-6
@@ -718,11 +718,7 @@ branches:
         # Full-dim leaves + generous intermediate truncation → near-exact
         hs_nested = hierarchical_diag(circ;
             system_hierarchy=[[[1], [2]], [3]],
-            subsystem_trunc_dims=Dict(
-                (1,1) => nstates,   # leaf [1]
-                (1,2) => nstates,   # leaf [2]
-                (1,)  => nstates^2, # intermediate: keep all states
-                (2,)  => nstates))  # leaf [3]
+            subsystem_trunc_dims=[[nstates^2, [nstates, nstates]], nstates])
         evals_nested = eigenvals(hs_nested; evals_count=6)
         evals_nested .-= evals_nested[1]
         @test evals_nested ≈ evals_full atol=1e-6
@@ -730,11 +726,7 @@ branches:
         # Truncated nested: [[[1],[2]], [3]] with real truncation
         hs_trunc = hierarchical_diag(circ;
             system_hierarchy=[[[1], [2]], [3]],
-            subsystem_trunc_dims=Dict(
-                (1,1) => 8,    # leaf [1]
-                (1,2) => 8,    # leaf [2]
-                (1,)  => 12,   # intermediate group
-                (2,)  => 8))   # leaf [3]
+            subsystem_trunc_dims=[[12, [8, 8]], 8])
         evals_trunc = eigenvals(hs_trunc; evals_count=6)
         evals_trunc .-= evals_trunc[1]
         for i in 2:4
@@ -757,7 +749,7 @@ branches:
 
         # Use explicit HierarchyGroup/HierarchyLeaf types
         hier = HierarchyGroup([HierarchyLeaf([1]), HierarchyLeaf([2])])
-        td = Dict((1,) => nstates, (2,) => nstates)
+        td = [nstates, nstates]
         hs = hierarchical_diag(circ;
             system_hierarchy=hier,
             subsystem_trunc_dims=td)
@@ -783,7 +775,7 @@ branches:
         # Single leaf group with all modes
         hs = hierarchical_diag(circ;
             system_hierarchy=[[1, 2]],
-            subsystem_trunc_dims=Dict(1=>20))
+            subsystem_trunc_dims=[20])
         evals_hier = eigenvals(hs; evals_count=4)
         evals_hier .-= evals_hier[1]
 
@@ -821,7 +813,7 @@ branches:
 
             hs = hierarchical_diag(circ;
                 system_hierarchy=[[1], [2], [3]],
-                subsystem_trunc_dims=Dict(1=>3, 2=>3, 3=>3))
+                subsystem_trunc_dims=[3, 3, 3])
 
             @test length(hs.subsystems) == 3
             @test all(sub -> sub isa SubCircuit, hs.subsystems)
@@ -1094,9 +1086,8 @@ branches:
     # ── Hierarchical analysis APIs (configure!, sym_hamiltonian, sym_interaction) ─
 
     @testset "HD truncation template" begin
-        @test truncation_template([[1], [2], [3]]) == Dict(1 => 6, 2 => 6, 3 => 6)
-        @test truncation_template([[[1], [2]], [3]]) ==
-              Dict((1,) => 30, (1, 1) => 6, (1, 2) => 6, (2,) => 6)
+        @test truncation_template([[1], [2], [3]]) == [6, 6, 6]
+        @test truncation_template([[[1], [2]], [3]]) == [[30, [6, 6]], 6]
     end
 
     @testset "configure! stores hierarchy state" begin
@@ -1107,7 +1098,7 @@ branches:
   - [C, 1, 2, EC=0.1]
 """
         circ = Circuit(desc; ncut=10)
-        configure!(circ; system_hierarchy=[[1],[2]], subsystem_trunc_dims=Dict(1=>10, 2=>10))
+        configure!(circ; system_hierarchy=[[1],[2]], subsystem_trunc_dims=[10, 10])
 
         @test circ._hierarchical_diagonalization == true
         @test circ._hilbert_space isa HilbertSpace
@@ -1118,7 +1109,7 @@ branches:
         @test circ._subsystem_interactions_sym !== nothing
     end
 
-    @testset "configure! and hierarchical_diag default HD truncation" begin
+    @testset "configure! and hierarchical_diag strict truncation requirement" begin
         desc = """
 branches:
   - [JJ, 0, 1, EJ=4.5, EC=0.1]
@@ -1138,15 +1129,21 @@ branches:
         set_param!(circ, :Φ1, 0.0)
         set_param!(circ, :Φ2, 0.0)
         set_param!(circ, :Φ3, 0.0)
-        configure!(circ; system_hierarchy=[[1], [2], [3]])
-        @test circ._subsystem_trunc_dims == Dict(1 => 6, 2 => 6, 3 => 6)
+        @test_throws ArgumentError configure!(circ; system_hierarchy=[[1], [2], [3]])
+
+        template = truncation_template([[1], [2], [3]])
+        configure!(circ; system_hierarchy=[[1], [2], [3]], subsystem_trunc_dims=template)
+        @test circ._subsystem_trunc_dims == [6, 6, 6]
         @test [hilbertdim(sub) for sub in circ._subsystems] == [6, 6, 6]
 
         circ2 = Circuit(desc; ncut=6)
         set_param!(circ2, :Φ1, 0.0)
         set_param!(circ2, :Φ2, 0.0)
         set_param!(circ2, :Φ3, 0.0)
-        hs = hierarchical_diag(circ2; system_hierarchy=[[1], [2], [3]])
+        @test_throws UndefKeywordError hierarchical_diag(circ2; system_hierarchy=[[1], [2], [3]])
+        hs = hierarchical_diag(circ2;
+            system_hierarchy=[[1], [2], [3]],
+            subsystem_trunc_dims=[6, 6, 6])
         @test [hilbertdim(sub) for sub in hs.subsystems] == [6, 6, 6]
     end
 
@@ -1164,7 +1161,7 @@ branches:
         # Without configure!, subsystem_index should error
         @test_throws ErrorException sym_hamiltonian(circ; subsystem_index=1)
 
-        configure!(circ; system_hierarchy=[[1],[2]], subsystem_trunc_dims=Dict(1=>10, 2=>10))
+        configure!(circ; system_hierarchy=[[1],[2]], subsystem_trunc_dims=[10, 10])
 
         # Full Hamiltonian still works
         H_full = sym_hamiltonian(circ)
@@ -1207,9 +1204,9 @@ branches:
         # Without configure!, should error
         @test_throws ErrorException sym_interaction(circ; subsystem_indices=(1, 2))
 
-        configure!(circ; system_hierarchy=[[1],[2]], subsystem_trunc_dims=Dict(1=>10, 2=>10))
+        configure!(circ; system_hierarchy=[[1],[2]], subsystem_trunc_dims=[10, 10])
 
-        H_int = sym_interaction(circ; subsystem_indices=(1, 2))
+        H_int = sym_interaction(circ; subsystem_indices=(1, 2), return_expr=true)
         @test H_int isa Sym.Num
 
         # Should be nontrivial (not zero) for capacitively coupled circuit
@@ -1224,7 +1221,7 @@ branches:
         @test has_mode(int_vars, 2)
 
         # Symmetric: (1,2) and (2,1) should give same result
-        H_int_rev = sym_interaction(circ; subsystem_indices=(2, 1))
+        H_int_rev = sym_interaction(circ; subsystem_indices=(2, 1), return_expr=true)
         @test isequal(H_int, H_int_rev)
     end
 
@@ -1238,12 +1235,12 @@ branches:
   - [C, 1, 2, EC=0.1]
 """
         circ = Circuit(desc; ncut=10)
-        configure!(circ; system_hierarchy=[[1],[2]], subsystem_trunc_dims=Dict(1=>10, 2=>10))
+        configure!(circ; system_hierarchy=[[1],[2]], subsystem_trunc_dims=[10, 10])
 
         H_full = sym_hamiltonian(circ)
         H1 = sym_hamiltonian(circ; subsystem_index=1)
         H2 = sym_hamiltonian(circ; subsystem_index=2)
-        H_int = sym_interaction(circ; subsystem_indices=(1, 2))
+        H_int = sym_interaction(circ; subsystem_indices=(1, 2), return_expr=true)
 
         # H1 + H2 + H_int should equal H_full (symbolic difference simplifies to 0)
         diff = Sym.simplify(Sym.expand(H1 + H2 + H_int - H_full))
@@ -1273,7 +1270,7 @@ branches:
 
         configure!(circ;
             system_hierarchy=[[1], [2], [3]],
-            subsystem_trunc_dims=Dict(1=>3, 2=>3, 3=>3))
+            subsystem_trunc_dims=[3, 3, 3])
 
         # 3 subsystems
         @test length(circ._subsystems) == 3
@@ -1288,7 +1285,7 @@ branches:
 
         # Interactions between all pairs should exist (capacitive coupling)
         for (i, j) in [(1,2), (2,3), (1,3)]
-            H_int = sym_interaction(circ; subsystem_indices=(i, j))
+            H_int = sym_interaction(circ; subsystem_indices=(i, j), return_expr=true)
             @test H_int isa ScQubitsMimic.Symbolics.Num
             # At least some pairs should have nontrivial coupling
         end
@@ -1300,9 +1297,9 @@ branches:
             abs(parse(Float64, coeff))
         end
 
-        H12 = sym_interaction(circ; subsystem_indices=(1, 2))
-        H23 = sym_interaction(circ; subsystem_indices=(2, 3))
-        H13 = sym_interaction(circ; subsystem_indices=(1, 3))
+        H12 = sym_interaction(circ; subsystem_indices=(1, 2), return_expr=true)
+        H23 = sym_interaction(circ; subsystem_indices=(2, 3), return_expr=true)
+        H13 = sym_interaction(circ; subsystem_indices=(1, 3), return_expr=true)
 
         @test !isequal(H12, Sym.Num(0))
         @test !isequal(H23, Sym.Num(0))
@@ -1310,6 +1307,22 @@ branches:
         @test interaction_strength(H13) > 1e-4
         @test interaction_strength(H12) > 10 * interaction_strength(H13)
         @test interaction_strength(H23) > 10 * interaction_strength(H13)
+
+        # Arbitrary subsystem-set interaction API (scqubits parity semantics).
+        H123_initial = sym_interaction(circ; subsystem_indices=(1, 2, 3), return_expr=true)
+        @test isequal(H123_initial, Sym.Num(0))
+
+        # Inject one synthetic 3-subsystem interaction term to test tuple matching.
+        synthetic_123 = Sym.variable(:nθ, 1) * Sym.variable(:nθ, 2) * Sym.variable(:nθ, 3)
+        circ._subsystem_interactions_sym[Set([1, 2, 3])] = synthetic_123
+        H123 = sym_interaction(circ; subsystem_indices=(1, 2, 3), return_expr=true)
+        H123_rev = sym_interaction(circ; subsystem_indices=(3, 1, 2), return_expr=true)
+        @test !isequal(H123, Sym.Num(0))
+        @test isequal(H123, H123_rev)
+
+        # Non-return mode should print and return `nothing`.
+        @test sym_interaction(circ; subsystem_indices=(1, 2), return_expr=false) === nothing
+        @test sym_interaction(circ; subsystem_indices=(1, 2), return_expr=false, print_latex=true) === nothing
     end
 
     @testset "effective_hamiltonian on simple two-subsystem circuit" begin
@@ -1320,27 +1333,34 @@ branches:
   - [C, 1, 2, EC=0.1]
 """
         circ = Circuit(desc; ncut=10)
-        configure!(circ; system_hierarchy=[[1], [2]])
+        configure!(circ; system_hierarchy=[[1], [2]], subsystem_trunc_dims=[10, 10])
 
         eff = effective_hamiltonian(circ; projection_dims=(2, 2), decompose_pauli=true)
         @test eff.basis_labels == [(1, 1), (1, 2), (2, 1), (2, 2)]
+        @test size(eff.overlap_matrix) == (4, 4)
         @test isapprox(eff.H_full_eff, eff.H_full_eff', atol=1e-10)
         @test isapprox(eff.H_int_eff, eff.H_int_eff', atol=1e-10)
         @test isapprox(eff.H_full_eff, eff.H_bare_eff + eff.H_int_eff, atol=1e-10)
         @test eff.pauli_terms !== nothing
 
+        # The overlap_matrix (sub-selection) diagonal should be positive —
+        # each selected dressed state has meaningful overlap with its bare counterpart.
+        gram = eff.overlap_matrix' * eff.overlap_matrix
+        @test all(real(diag(gram)) .> 0.1)
+
+        # Pauli decomposition is on H_int_eff (not H_full_eff)
         pauli = Dict(
             'I' => ComplexF64[1 0; 0 1],
             'X' => ComplexF64[0 1; 1 0],
             'Y' => ComplexF64[0 -im; im 0],
             'Z' => ComplexF64[1 0; 0 -1],
         )
-        recon = zeros(ComplexF64, size(eff.H_full_eff))
+        recon = zeros(ComplexF64, size(eff.H_int_eff))
         for (label, coeff) in eff.pauli_terms
             op = reduce(kron, (pauli[sym] for sym in label))
             recon .+= coeff .* op
         end
-        @test isapprox(recon, eff.H_full_eff, atol=1e-10)
+        @test isapprox(recon, eff.H_int_eff, atol=1e-10)
     end
 
     @testset "Yan-style effective Hamiltonian and avoided crossing" begin
@@ -1363,9 +1383,10 @@ branches:
         set_param!(circ, :Φ1, 0.0)
         set_param!(circ, :Φ2, 0.0)
         set_param!(circ, :Φ3, 0.0)
-        configure!(circ; system_hierarchy=[[1], [2], [3]])
+        configure!(circ; system_hierarchy=[[1], [2], [3]], subsystem_trunc_dims=[6, 6, 6])
 
         eff_222 = effective_hamiltonian(circ; projection_dims=(2, 2, 2), decompose_pauli=true)
+        @test size(eff_222.overlap_matrix) == (8, 8)
         @test isapprox(eff_222.H_full_eff, eff_222.H_full_eff', atol=1e-10)
         @test isapprox(eff_222.H_full_eff, eff_222.H_bare_eff + eff_222.H_int_eff, atol=1e-10)
         g12 = exchange_coupling(eff_222.H_int_eff, eff_222.basis_labels, (2, 1, 1), (1, 2, 1))
@@ -1408,7 +1429,7 @@ branches:
   - [C, 1, 2, EC=0.1]
 """
         circ = Circuit(desc; ncut=10)
-        configure!(circ; system_hierarchy=[[1],[2]], subsystem_trunc_dims=Dict(1=>10, 2=>10))
+        configure!(circ; system_hierarchy=[[1],[2]], subsystem_trunc_dims=[10, 10])
 
         @test circ._hilbert_space !== nothing
         @test circ._subsystem_sym_hamiltonians !== nothing
@@ -1435,7 +1456,7 @@ branches:
 """
         circ = Circuit(desc; ncut=5)
         configure!(circ; system_hierarchy=[[1,2],[3]],
-                  subsystem_trunc_dims=Dict(1=>20, 2=>10))
+                  subsystem_trunc_dims=[20, 10])
 
         H1 = sym_hamiltonian(circ; subsystem_index=1)
         H2 = sym_hamiltonian(circ; subsystem_index=2)
