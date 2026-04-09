@@ -265,7 +265,7 @@ function _collect_all_modes(v::Vector)
 end
 
 """
-    configure!(circ::Circuit; system_hierarchy, subsystem_trunc_dims)
+    configure!(circ::Circuit; system_hierarchy, subsystem_trunc_dims=nothing)
 
 Configure hierarchical diagonalization for the circuit, storing hierarchy
 metadata and computing both symbolic and numerical decompositions.
@@ -286,10 +286,14 @@ sym_hamiltonian(circ; subsystem_index=1)      # symbolic H for subsystem 1
 sym_interaction(circ; subsystem_indices=(1,2)) # coupling between subsystems 1 and 2
 ```
 """
-function configure!(circ::Circuit; system_hierarchy, subsystem_trunc_dims)
+function configure!(circ::Circuit; system_hierarchy, subsystem_trunc_dims=nothing)
+    resolved_trunc_dims = subsystem_trunc_dims === nothing ?
+                          truncation_template(system_hierarchy) :
+                          subsystem_trunc_dims
+
     # Store configuration
     circ._system_hierarchy = system_hierarchy
-    circ._subsystem_trunc_dims = subsystem_trunc_dims
+    circ._subsystem_trunc_dims = resolved_trunc_dims
     circ._hierarchical_diagonalization = true
 
     # Symbolic decomposition
@@ -300,7 +304,7 @@ function configure!(circ::Circuit; system_hierarchy, subsystem_trunc_dims)
     # Numerical hierarchical diagonalization (reuse existing function)
     hs = hierarchical_diag(circ;
         system_hierarchy=system_hierarchy,
-        subsystem_trunc_dims=subsystem_trunc_dims)
+        subsystem_trunc_dims=resolved_trunc_dims)
     circ._hilbert_space = hs
     circ._subsystems = SubCircuit[s for s in hs.subsystems]
 

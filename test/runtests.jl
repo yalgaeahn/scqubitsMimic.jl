@@ -1093,6 +1093,12 @@ branches:
 
     # ── Hierarchical analysis APIs (configure!, sym_hamiltonian, sym_interaction) ─
 
+    @testset "HD truncation template" begin
+        @test truncation_template([[1], [2], [3]]) == Dict(1 => 6, 2 => 6, 3 => 6)
+        @test truncation_template([[[1], [2]], [3]]) ==
+              Dict((1,) => 30, (1, 1) => 6, (1, 2) => 6, (2,) => 6)
+    end
+
     @testset "configure! stores hierarchy state" begin
         desc = """
 branches:
@@ -1110,6 +1116,38 @@ branches:
         @test all(sub -> sub isa SubCircuit, circ._subsystems)
         @test circ._subsystem_sym_hamiltonians !== nothing
         @test circ._subsystem_interactions_sym !== nothing
+    end
+
+    @testset "configure! and hierarchical_diag default HD truncation" begin
+        desc = """
+branches:
+  - [JJ, 0, 1, EJ=4.5, EC=0.1]
+  - [JJ, 1, 0, EJ=10.5, EC=0.1]
+  - [C, 1, 0, EC=0.2]
+  - [C, 1, 2, EC=5.0]
+  - [JJ, 0, 2, EJ=30.0, EC=0.1]
+  - [JJ, 2, 0, EJ=20.0, EC=0.1]
+  - [C, 2, 0, EC=0.1]
+  - [C, 2, 3, EC=5.0]
+  - [JJ, 0, 3, EJ=4.6, EC=0.1]
+  - [JJ, 3, 0, EJ=10.0, EC=0.1]
+  - [C, 3, 0, EC=0.2]
+  - [C, 1, 3, EC=500.0]
+"""
+        circ = Circuit(desc; ncut=6)
+        set_param!(circ, :Φ1, 0.0)
+        set_param!(circ, :Φ2, 0.0)
+        set_param!(circ, :Φ3, 0.0)
+        configure!(circ; system_hierarchy=[[1], [2], [3]])
+        @test circ._subsystem_trunc_dims == Dict(1 => 6, 2 => 6, 3 => 6)
+        @test [hilbertdim(sub) for sub in circ._subsystems] == [6, 6, 6]
+
+        circ2 = Circuit(desc; ncut=6)
+        set_param!(circ2, :Φ1, 0.0)
+        set_param!(circ2, :Φ2, 0.0)
+        set_param!(circ2, :Φ3, 0.0)
+        hs = hierarchical_diag(circ2; system_hierarchy=[[1], [2], [3]])
+        @test [hilbertdim(sub) for sub in hs.subsystems] == [6, 6, 6]
     end
 
     @testset "sym_hamiltonian with subsystem_index" begin
@@ -1272,6 +1310,94 @@ branches:
         @test interaction_strength(H13) > 1e-4
         @test interaction_strength(H12) > 10 * interaction_strength(H13)
         @test interaction_strength(H23) > 10 * interaction_strength(H13)
+    end
+
+    @testset "effective_hamiltonian on simple two-subsystem circuit" begin
+        desc = """
+branches:
+  - [JJ, 0, 1, EJ=10.0, EC=0.3]
+  - [JJ, 0, 2, EJ=8.0, EC=0.4]
+  - [C, 1, 2, EC=0.1]
+"""
+        circ = Circuit(desc; ncut=10)
+        configure!(circ; system_hierarchy=[[1], [2]])
+
+        eff = effective_hamiltonian(circ; projection_dims=(2, 2), decompose_pauli=true)
+        @test eff.basis_labels == [(1, 1), (1, 2), (2, 1), (2, 2)]
+        @test isapprox(eff.H_full_eff, eff.H_full_eff', atol=1e-10)
+        @test isapprox(eff.H_int_eff, eff.H_int_eff', atol=1e-10)
+        @test isapprox(eff.H_full_eff, eff.H_bare_eff + eff.H_int_eff, atol=1e-10)
+        @test eff.pauli_terms !== nothing
+
+        pauli = Dict(
+            'I' => ComplexF64[1 0; 0 1],
+            'X' => ComplexF64[0 1; 1 0],
+            'Y' => ComplexF64[0 -im; im 0],
+            'Z' => ComplexF64[1 0; 0 -1],
+        )
+        recon = zeros(ComplexF64, size(eff.H_full_eff))
+        for (label, coeff) in eff.pauli_terms
+            op = reduce(kron, (pauli[sym] for sym in label))
+            recon .+= coeff .* op
+        end
+        @test isapprox(recon, eff.H_full_eff, atol=1e-10)
+    end
+
+    @testset "Yan-style effective Hamiltonian and avoided crossing" begin
+        desc = """
+branches:
+  - [JJ, 0, 1, EJ=4.5, EC=0.1]
+  - [JJ, 1, 0, EJ=10.5, EC=0.1]
+  - [C, 1, 0, EC=0.2]
+  - [C, 1, 2, EC=5.0]
+  - [JJ, 0, 2, EJ=30.0, EC=0.1]
+  - [JJ, 2, 0, EJ=20.0, EC=0.1]
+  - [C, 2, 0, EC=0.1]
+  - [C, 2, 3, EC=5.0]
+  - [JJ, 0, 3, EJ=4.6, EC=0.1]
+  - [JJ, 3, 0, EJ=10.0, EC=0.1]
+  - [C, 3, 0, EC=0.2]
+  - [C, 1, 3, EC=500.0]
+"""
+        circ = Circuit(desc; ncut=6)
+        set_param!(circ, :Φ1, 0.0)
+        set_param!(circ, :Φ2, 0.0)
+        set_param!(circ, :Φ3, 0.0)
+        configure!(circ; system_hierarchy=[[1], [2], [3]])
+
+        eff_222 = effective_hamiltonian(circ; projection_dims=(2, 2, 2), decompose_pauli=true)
+        @test isapprox(eff_222.H_full_eff, eff_222.H_full_eff', atol=1e-10)
+        @test isapprox(eff_222.H_full_eff, eff_222.H_bare_eff + eff_222.H_int_eff, atol=1e-10)
+        g12 = exchange_coupling(eff_222.H_int_eff, eff_222.basis_labels, (2, 1, 1), (1, 2, 1))
+        g23 = exchange_coupling(eff_222.H_int_eff, eff_222.basis_labels, (1, 2, 1), (1, 1, 2))
+        g13 = exchange_coupling(eff_222.H_int_eff, eff_222.basis_labels, (2, 1, 1), (1, 1, 2))
+        @test g12 > g13
+        @test g23 > g13
+        @test g13 > 0
+        @test eff_222.pauli_terms !== nothing
+
+        eff_232 = effective_hamiltonian(circ; projection_dims=(2, 3, 2), decompose_pauli=false)
+        @test length(eff_232.basis_labels) == 12
+        @test size(eff_232.H_full_eff) == (12, 12)
+        @test eff_232.pauli_terms === nothing
+
+        sweep_vals = collect(2π .* range(-0.45, -0.35; length=21))
+        crossing = avoided_crossing_coupling(circ;
+            state_a=(2, 1, 1),
+            state_b=(1, 2, 1),
+            sweep_param=:Φ2,
+            sweep_vals=sweep_vals,
+            evals_count=16)
+        endpoint_min = min(crossing.gap[1], crossing.gap[end])
+        @test -0.45 <= crossing.param_at_min_gap / (2π) <= -0.35
+        @test abs(crossing.param_at_min_gap / (2π) + 0.4) < 0.03
+        @test crossing.min_gap < endpoint_min
+        @test crossing.g_half_gap > 0
+
+        set_param!(circ, :Φ2, crossing.param_at_min_gap)
+        eff_res = effective_hamiltonian(circ; projection_dims=(2, 2, 2), decompose_pauli=false)
+        g_proj = exchange_coupling(eff_res.H_int_eff, eff_res.basis_labels, (2, 1, 1), (1, 2, 1))
+        @test 0.25 <= crossing.g_half_gap / g_proj <= 4.0
     end
 
     @testset "invalidate_cache! clears numerical but keeps symbolic" begin

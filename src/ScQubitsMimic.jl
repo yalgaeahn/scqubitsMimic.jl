@@ -40,6 +40,7 @@ include("hilbert_space.jl")
 include("spectrum_lookup.jl")
 include("param_sweep.jl")
 include("dispersive.jl")
+include("effective_hamiltonian.jl")
 
 # ── Exports ──────────────────────────────────────────────────────────────────
 
@@ -76,6 +77,7 @@ export sym_hamiltonian, sym_hamiltonian_node, sym_lagrangian,
        variable_transformation, offset_charge_transformation,
        external_fluxes, sym_external_fluxes, offset_charges
 export SubCircuit, HierarchyLeaf, HierarchyGroup, HierarchyNode, hierarchical_diag
+export truncation_template
 
 # Circuit operators
 export n_operator_periodic, exp_i_theta_operator,
@@ -101,6 +103,7 @@ export generate_lookup!, dressed_index, bare_index,
        energy_by_dressed_index, energy_by_bare_index,
        op_in_dressed_eigenbasis
 export chi_matrix, self_kerr, lamb_shift
+export effective_hamiltonian, exchange_coupling, avoided_crossing_coupling
 
 # Plotting API stubs (implemented in ext/ScQubitsMimicMakieExt)
 function plot_evals_vs_paramvals end

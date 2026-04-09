@@ -33,6 +33,74 @@ end
 
 const HierarchyNode = Union{HierarchyLeaf, HierarchyGroup}
 
+# ── HD truncation defaults ───────────────────────────────────────────────────
+
+"""
+    truncation_template(system_hierarchy; individual_trunc_dim=6,
+                        combined_trunc_dim=30)
+
+Return a scqubits-style hierarchical truncation template for `system_hierarchy`.
+
+For a flat hierarchy such as `[[1], [2], [3]]`, this returns a Julia-friendly
+`Dict{Int,Int}` like `Dict(1 => 6, 2 => 6, 3 => 6)`.
+
+For a nested hierarchy such as `[[[1], [2]], [3]]`, this returns a
+path-keyed `Dict{Tuple{Vararg{Int}},Int}` such as
+`Dict((1,) => 30, (1,1) => 6, (1,2) => 6, (2,) => 6)`.
+
+These defaults mirror scqubits semantics:
+- leaf subsystems default to `individual_trunc_dim = 6`
+- combined groups default to `combined_trunc_dim = 30`
+"""
+function truncation_template(system_hierarchy;
+                             individual_trunc_dim::Int=6,
+                             combined_trunc_dim::Int=30)
+    individual_trunc_dim >= 1 || throw(ArgumentError(
+        "individual_trunc_dim must be positive, got $individual_trunc_dim"))
+    combined_trunc_dim >= 1 || throw(ArgumentError(
+        "combined_trunc_dim must be positive, got $combined_trunc_dim"))
+
+    hier = system_hierarchy isa HierarchyGroup ? system_hierarchy :
+           system_hierarchy isa HierarchyLeaf ? HierarchyGroup([system_hierarchy]) :
+           begin
+               node = _to_hierarchy_node(system_hierarchy)
+               node isa HierarchyLeaf ? HierarchyGroup([node]) : node
+           end
+
+    if all(child -> child isa HierarchyLeaf, hier.children)
+        return Dict(idx => individual_trunc_dim for idx in eachindex(hier.children))
+    end
+
+    template = Dict{Tuple{Vararg{Int}}, Int}()
+    for (idx, child) in enumerate(hier.children)
+        _fill_truncation_template!(template, child, (idx,),
+                                   individual_trunc_dim, combined_trunc_dim)
+    end
+    return template
+end
+
+function _fill_truncation_template!(template::Dict{Tuple{Vararg{Int}}, Int},
+                                    node::HierarchyLeaf,
+                                    path::Tuple{Vararg{Int}},
+                                    individual_trunc_dim::Int,
+                                    combined_trunc_dim::Int)
+    template[path] = individual_trunc_dim
+    return template
+end
+
+function _fill_truncation_template!(template::Dict{Tuple{Vararg{Int}}, Int},
+                                    node::HierarchyGroup,
+                                    path::Tuple{Vararg{Int}},
+                                    individual_trunc_dim::Int,
+                                    combined_trunc_dim::Int)
+    template[path] = combined_trunc_dim
+    for (idx, child) in enumerate(node.children)
+        _fill_truncation_template!(template, child, (path..., idx),
+                                   individual_trunc_dim, combined_trunc_dim)
+    end
+    return template
+end
+
 # ── SubCircuit type ──────────────────────────────────────────────────────────
 
 """
@@ -414,7 +482,7 @@ end
 """
     hierarchical_diag(circ::Circuit;
                       system_hierarchy,
-                      subsystem_trunc_dims) -> HilbertSpace
+                      subsystem_trunc_dims=nothing) -> HilbertSpace
 
 Partition circuit modes into subsystems and build a HilbertSpace using
 hierarchical diagonalization.
@@ -450,7 +518,7 @@ Intermediate groups are re-diagonalized and truncated; the top level is not.
 A `HilbertSpace` whose subsystems are truncated `SubCircuit`s with
 cross-coupling interaction terms.
 """
-function hierarchical_diag(circ::Circuit; system_hierarchy, subsystem_trunc_dims)
+function hierarchical_diag(circ::Circuit; system_hierarchy, subsystem_trunc_dims=nothing)
     # ── Normalize inputs ───────────────────────────────────────────────────
     if system_hierarchy isa HierarchyGroup
         hier = system_hierarchy
@@ -462,12 +530,16 @@ function hierarchical_diag(circ::Circuit; system_hierarchy, subsystem_trunc_dims
         end
     end
 
-    if subsystem_trunc_dims isa Dict{Int, Int} ||
-       (subsystem_trunc_dims isa Dict && keytype(subsystem_trunc_dims) == Int)
+    resolved_trunc_dims = subsystem_trunc_dims === nothing ?
+                          truncation_template(system_hierarchy) :
+                          subsystem_trunc_dims
+
+    if resolved_trunc_dims isa Dict{Int, Int} ||
+       (resolved_trunc_dims isa Dict && keytype(resolved_trunc_dims) == Int)
         td = Dict{Tuple{Vararg{Int}}, Int}((k,) => v
-                                            for (k, v) in subsystem_trunc_dims)
+                                            for (k, v) in resolved_trunc_dims)
     else
-        td = Dict{Tuple{Vararg{Int}}, Int}(subsystem_trunc_dims)
+        td = Dict{Tuple{Vararg{Int}}, Int}(resolved_trunc_dims)
     end
     sc = circ.symbolic_circuit
     vc = circ.var_categories
