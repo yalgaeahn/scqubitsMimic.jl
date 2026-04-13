@@ -16,6 +16,11 @@ Circuit branch element types.
 """
 @enum BranchType C_branch L_branch JJ_branch CJ_branch
 
+@doc "Capacitive branch tag in a `CircuitGraph`; uses `EC` as its energy parameter." C_branch
+@doc "Inductive branch tag in a `CircuitGraph`; uses `EL` as its energy parameter." L_branch
+@doc "Josephson-junction branch tag in a `CircuitGraph`; uses `EJ` and `EC` parameters." JJ_branch
+@doc "Capacitive-junction branch tag in a `CircuitGraph`; stores junction capacitance without Josephson energy." CJ_branch
+
 """
     Branch(branch_type, node_i, node_j, parameters)
 

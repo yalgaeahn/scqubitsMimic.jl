@@ -65,19 +65,13 @@ function hamiltonian(t::TunableTransmon)
 end
 
 function eigenvals(t::TunableTransmon; evals_count::Int=t.truncated_dim)
-    H = hamiltonian(t)
-    vals = eigenenergies(H)
-    n = min(evals_count, length(vals))
-    return real.(vals[1:n])
+    H_tri = _transmon_charge_basis_tridiagonal(ej_effective(t), t.EC, t.ng, t.ncut)
+    return _lowest_hermitian_eigenvalues(H_tri, evals_count)
 end
 
 function eigensys(t::TunableTransmon; evals_count::Int=t.truncated_dim)
-    H = hamiltonian(t)
-    result = eigenstates(H)
-    n = min(evals_count, length(result.values))
-    vals = real.(result.values[1:n])
-    vecs = result.vectors[:, 1:n]
-    return vals, vecs
+    H_tri = _transmon_charge_basis_tridiagonal(ej_effective(t), t.EC, t.ng, t.ncut)
+    return _lowest_hermitian_eigensystem(H_tri, evals_count)
 end
 
 # ── Operators ───────────────────────────────────────────────────────────────

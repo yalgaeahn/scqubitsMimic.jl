@@ -25,17 +25,19 @@ function chi_matrix(hs::HilbertSpace)
 end
 
 """
-    chi_matrix(sweep::HilbertSpaceSweep) -> Array{Float64, 3}
+    chi_matrix(sweep::ParameterSweep) -> Array{Float64, 3}
 
 Chi matrix at each sweep point. Returns array of size `(n_points, n_sub, n_sub)`.
-Requires the sweep to have been created with `store_lookups=true`.
+Requires lookup data to be present on the sweep, either because it was created
+with `store_lookups=true` or because `generate_lookup!(sweep)` was called after
+`run!(sweep)`.
 The result depends only on the lookups stored on the sweep itself; if strong
 hybridization requires relaxed bare-label tracking, construct the sweep with
 `ignore_low_overlap=true`.
 """
-function chi_matrix(sweep::HilbertSpaceSweep)
-    sweep.lookups === nothing &&
-        error("Sweep must be created with store_lookups=true to compute chi_matrix")
+function chi_matrix(sweep::ParameterSweep)
+    lookup_exists(sweep) ||
+        error("Sweep lookup data are unavailable. Create the sweep with store_lookups=true or call generate_lookup!(sweep) after run!(sweep).")
     n_sub = length(sweep.hilbertspace.subsystems)
     n_points = size(sweep.dressed_evals, 1)
     result = Array{Float64, 3}(undef, n_points, n_sub, n_sub)
@@ -92,14 +94,14 @@ function self_kerr(hs::HilbertSpace, subsys_idx::Int)
 end
 
 """
-    self_kerr(sweep::HilbertSpaceSweep, subsys_idx::Int) -> Vector{Float64}
+    self_kerr(sweep::ParameterSweep, subsys_idx::Int) -> Vector{Float64}
 
-Self-Kerr at each sweep point. Requires `store_lookups=true`.
+Self-Kerr at each sweep point. Requires lookup data on the sweep.
 Uses the sweep-stored lookup policy, not `sweep.hilbertspace.ignore_low_overlap`.
 """
-function self_kerr(sweep::HilbertSpaceSweep, subsys_idx::Int)
-    sweep.lookups === nothing &&
-        error("Sweep must be created with store_lookups=true to compute self_kerr")
+function self_kerr(sweep::ParameterSweep, subsys_idx::Int)
+    lookup_exists(sweep) ||
+        error("Sweep lookup data are unavailable. Create the sweep with store_lookups=true or call generate_lookup!(sweep) after run!(sweep).")
     n_sub = length(sweep.hilbertspace.subsystems)
     n_points = size(sweep.dressed_evals, 1)
     return [_self_kerr_from_lookup(sweep.lookups[k], subsys_idx, n_sub)
@@ -149,14 +151,14 @@ function lamb_shift(hs::HilbertSpace, subsys_idx::Int)
 end
 
 """
-    lamb_shift(sweep::HilbertSpaceSweep, subsys_idx::Int) -> Vector{Float64}
+    lamb_shift(sweep::ParameterSweep, subsys_idx::Int) -> Vector{Float64}
 
-Lamb shift at each sweep point. Requires `store_lookups=true`.
+Lamb shift at each sweep point. Requires lookup data on the sweep.
 Uses the sweep-stored lookup policy, not `sweep.hilbertspace.ignore_low_overlap`.
 """
-function lamb_shift(sweep::HilbertSpaceSweep, subsys_idx::Int)
-    sweep.lookups === nothing &&
-        error("Sweep must be created with store_lookups=true to compute lamb_shift")
+function lamb_shift(sweep::ParameterSweep, subsys_idx::Int)
+    lookup_exists(sweep) ||
+        error("Sweep lookup data are unavailable. Create the sweep with store_lookups=true or call generate_lookup!(sweep) after run!(sweep).")
     n_sub = length(sweep.hilbertspace.subsystems)
     n_points = size(sweep.dressed_evals, 1)
     result = Vector{Float64}(undef, n_points)

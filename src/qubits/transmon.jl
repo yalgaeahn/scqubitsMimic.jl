@@ -44,11 +44,13 @@ function hamiltonian(t::Transmon)
 end
 
 function eigenvals(t::Transmon; evals_count::Int=t.truncated_dim)
-    invoke(eigenvals, Tuple{AbstractQuantumSystem}, t; evals_count=evals_count)
+    H_tri = _transmon_charge_basis_tridiagonal(t.EJ, t.EC, t.ng, t.ncut)
+    return _lowest_hermitian_eigenvalues(H_tri, evals_count)
 end
 
 function eigensys(t::Transmon; evals_count::Int=t.truncated_dim)
-    invoke(eigensys, Tuple{AbstractQuantumSystem}, t; evals_count=evals_count)
+    H_tri = _transmon_charge_basis_tridiagonal(t.EJ, t.EC, t.ng, t.ncut)
+    return _lowest_hermitian_eigensystem(H_tri, evals_count)
 end
 
 # ── Transmon-specific operators ──────────────────────────────────────────────

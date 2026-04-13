@@ -30,9 +30,7 @@ Compute the lowest `evals_count` eigenvalues of the system Hamiltonian.
 """
 function eigenvals(sys::AbstractQuantumSystem; evals_count::Int=6)
     H = hamiltonian(sys)
-    vals = eigenenergies(H)
-    n = min(evals_count, length(vals))
-    return real.(vals[1:n])
+    return _lowest_hermitian_eigenvalues(H, evals_count)
 end
 
 """
@@ -42,13 +40,7 @@ Compute eigenvalues and eigenvectors. Returns `(eigenvalues, eigenvectors)`.
 """
 function eigensys(sys::AbstractQuantumSystem; evals_count::Int=6)
     H = hamiltonian(sys)
-    dim = hilbertdim(sys)
-
-    result = eigenstates(H)
-    n = min(evals_count, length(result.values))
-    vals = real.(result.values[1:n])
-    vecs = result.vectors[:, 1:n]
-    return vals, vecs
+    return _lowest_hermitian_eigensystem(H, evals_count)
 end
 
 """

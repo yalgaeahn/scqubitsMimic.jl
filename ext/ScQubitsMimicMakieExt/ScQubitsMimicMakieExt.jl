@@ -4,12 +4,12 @@ using ScQubitsMimic
 using CairoMakie
 
 import ScQubitsMimic: plot_evals_vs_paramvals, plot_matrixelements,
-                      plot_wavefunction, plot_chi_vs_paramvals
+                      plot_wavefunction, plot_chi_vs_paramvals, plot_transitions
 
 # ── Eigenvalue spectrum vs parameter ────────────────────────────────────────
 
 """
-    plot_evals_vs_paramvals(sweep::ParameterSweep; kwargs...) -> Figure
+    plot_evals_vs_paramvals(sweep::SingleSystemSweep; kwargs...) -> Figure
 
 Plot eigenvalues vs parameter values from a single-system sweep.
 
@@ -18,7 +18,7 @@ Plot eigenvalues vs parameter values from a single-system sweep.
 - `evals_count::Int=nothing` — number of levels to plot (default: all)
 - `fig_ax=nothing` — optional `(Figure, Axis)` to plot into
 """
-function plot_evals_vs_paramvals(sweep::ParameterSweep;
+function plot_evals_vs_paramvals(sweep::SingleSystemSweep;
                                   subtract_ground::Bool=true,
                                   evals_count::Union{Nothing,Int}=nothing,
                                   fig_ax=nothing)
@@ -47,16 +47,16 @@ function plot_evals_vs_paramvals(sweep::ParameterSweep;
 end
 
 """
-    plot_evals_vs_paramvals(sweep::HilbertSpaceSweep; kwargs...) -> Figure
+    plot_evals_vs_paramvals(sweep::ParameterSweep; kwargs...) -> Figure
 
-Plot dressed eigenvalues vs parameter from a HilbertSpace sweep.
+Plot dressed eigenvalues vs parameter from a composite ParameterSweep.
 """
-function plot_evals_vs_paramvals(sweep::HilbertSpaceSweep;
+function plot_evals_vs_paramvals(sweep::ParameterSweep;
                                   param_name::Union{Nothing,Symbol}=nothing,
                                   subtract_ground::Bool=true,
                                   evals_count::Union{Nothing,Int}=nothing,
                                   fig_ax=nothing)
-    pname = param_name === nothing ? first(keys(sweep.param_vals)) : param_name
+    pname = param_name === nothing ? first(sweep.param_order) : param_name
     pvals = sweep.param_vals[pname]
     evals = copy(sweep.dressed_evals)
     n_evals = evals_count === nothing ? size(evals, 2) : min(evals_count, size(evals, 2))
@@ -166,19 +166,19 @@ end
 # ── Chi vs parameter ────────────────────────────────────────────────────────
 
 """
-    plot_chi_vs_paramvals(sweep::HilbertSpaceSweep;
+    plot_chi_vs_paramvals(sweep::ParameterSweep;
                            subsys_pair=(1,2), param_name=nothing) -> Figure
 
 Plot dispersive shift χ vs parameter from a sweep with stored lookups.
 """
-function plot_chi_vs_paramvals(sweep::HilbertSpaceSweep;
+function plot_chi_vs_paramvals(sweep::ParameterSweep;
                                 subsys_pair::Tuple{Int,Int}=(1, 2),
                                 param_name::Union{Nothing,Symbol}=nothing)
     sweep.lookups === nothing &&
         error("Sweep must be created with store_lookups=true for chi plot")
 
     chi_arr = ScQubitsMimic.chi_matrix(sweep)
-    pname = param_name === nothing ? first(keys(sweep.param_vals)) : param_name
+    pname = param_name === nothing ? first(sweep.param_order) : param_name
     pvals = sweep.param_vals[pname]
 
     i, j = subsys_pair
@@ -193,6 +193,73 @@ function plot_chi_vs_paramvals(sweep::HilbertSpaceSweep;
     ax.ylabel = "χ (MHz)"
 
     return fig
+end
+
+function plot_transitions(slice::ScQubitsMimic.SweepSlice;
+                          subsystems=nothing,
+                          initial=nothing,
+                          final=nothing,
+                          sidebands::Bool=false,
+                          photon_number::Int=1,
+                          make_positive::Bool=true,
+                          coloring::AbstractString="transition",
+                          fig_ax=nothing,
+                          linewidth::Float64=2.0)
+    param_name, param_vals = ScQubitsMimic.slice_param_axis(slice)
+    owns_axis = fig_ax === nothing
+    if fig_ax === nothing
+        fig = Figure(size=(760, 420))
+        ax = Axis(fig[1, 1],
+                  xlabel=string(param_name),
+                  ylabel="Transition energy (GHz)")
+    else
+        fig, ax = fig_ax
+    end
+
+    if lowercase(coloring) == "plain"
+        all_diffs = ScQubitsMimic.transition_background(slice;
+            initial=initial,
+            subsystems=subsystems,
+            photon_number=photon_number,
+            make_positive=make_positive)
+        for k in axes(all_diffs, 2)
+            lines!(ax, param_vals, all_diffs[:, k]; linewidth=1.2)
+        end
+        return fig
+    elseif lowercase(coloring) != "transition"
+        throw(ArgumentError("coloring must be either \"plain\" or \"transition\""))
+    end
+
+    all_diffs = ScQubitsMimic.transition_background(slice;
+        initial=initial,
+        subsystems=subsystems,
+        photon_number=photon_number,
+        make_positive=make_positive)
+    for k in axes(all_diffs, 2)
+        lines!(ax, param_vals, all_diffs[:, k];
+               color=:gainsboro, linewidth=0.9)
+    end
+
+    spec = ScQubitsMimic.transitions(slice;
+        as_specdata=true,
+        subsystems=subsystems,
+        initial=initial,
+        final=final,
+        sidebands=sidebands,
+        photon_number=photon_number,
+        make_positive=make_positive)
+    for (idx, label) in enumerate(spec.labels)
+        lines!(ax, spec.param_vals, spec.energy_table[:, idx];
+               linewidth=linewidth, label=label)
+    end
+    owns_axis && !isempty(spec.labels) && axislegend(ax; position=:rb)
+    return fig
+end
+
+function plot_transitions(sweep::ParameterSweep; kwargs...)
+    length(sweep.param_order) == 1 || throw(ArgumentError(
+        "plot_transitions(::ParameterSweep) only supports one-dimensional sweeps; use `sweep[...]` first"))
+    return plot_transitions(ScQubitsMimic.full_slice(sweep); kwargs...)
 end
 
 end # module

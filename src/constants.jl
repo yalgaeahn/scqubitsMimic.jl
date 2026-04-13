@@ -3,6 +3,14 @@
 # All values in SI units unless otherwise noted.
 # ──────────────────────────────────────────────────────────────────────────────
 
+"""
+    PhysicalConstants
+
+Collection of physical constants used by `ScQubitsMimic`.
+
+All values are expressed in SI units unless otherwise noted. The module is
+used primarily by `convert_units` and by circuit-energy conversions.
+"""
 module PhysicalConstants
 
 # Fundamental constants

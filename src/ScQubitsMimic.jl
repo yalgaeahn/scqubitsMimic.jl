@@ -14,6 +14,7 @@ include("units.jl")
 include("grid.jl")
 include("spectrum_data.jl")
 include("operators.jl")
+include("diag.jl")
 include("qubit_base.jl")
 
 # Circuit quantization pipeline
@@ -40,6 +41,7 @@ include("interaction.jl")
 include("hilbert_space.jl")
 include("spectrum_lookup.jl")
 include("param_sweep.jl")
+include("transitions.jl")
 include("dispersive.jl")
 
 # ── Exports ──────────────────────────────────────────────────────────────────
@@ -97,20 +99,66 @@ export annihilation_operator, creation_operator, number_operator
 export n_operator, exp_i_phi_operator, cos_phi_operator, sin_phi_operator, potential
 
 # Composite systems
-export HilbertSpace, InteractionTerm, ParameterSweep, HilbertSpaceSweep, SpectrumLookup
+export HilbertSpace, InteractionTerm, SingleSystemSweep, ParameterSweep, SweepSlice, SpectrumLookup
 export add_interaction!, add_operator!, diag!
-export generate_lookup!, dressed_index, bare_index,
-       energy_by_dressed_index, energy_by_bare_index,
+export run!
+export generate_lookup!, lookup_exists, dressed_index, bare_index,
+       energy_by_dressed_index, energy_by_bare_index, dressed_state_components,
+       transitions,
        op_in_dressed_eigenbasis, OVERLAP_THRESHOLD
 export chi_matrix, self_kerr, lamb_shift
 
 # Plotting API stubs (implemented in ext/ScQubitsMimicMakieExt)
+"""
+    plot_evals_vs_paramvals(sweep; kwargs...) -> Figure
+
+Plot eigenvalue traces from a [`SingleSystemSweep`](@ref) or
+[`ParameterSweep`](@ref).
+
+The plotting methods are provided by the `ScQubitsMimicMakieExt` extension and
+require `CairoMakie` to be loaded.
+"""
 function plot_evals_vs_paramvals end
+
+"""
+    plot_matrixelements(sys, op; kwargs...) -> Figure
+
+Plot a matrix-element heatmap for an operator acting on a supported quantum
+system.
+
+This plotting entry point is implemented by the `ScQubitsMimicMakieExt`
+extension and requires `CairoMakie`.
+"""
 function plot_matrixelements end
+
+"""
+    plot_wavefunction(sys, which=1; kwargs...) -> Figure
+
+Plot one or more 1D qubit wavefunctions using the Makie extension backend.
+Requires `CairoMakie` and the `ScQubitsMimicMakieExt` extension.
+"""
 function plot_wavefunction end
+
+"""
+    plot_chi_vs_paramvals(sweep::ParameterSweep; kwargs...) -> Figure
+
+Plot dispersive `χ` values extracted from a sweep with stored lookup data.
+Implemented by the `ScQubitsMimicMakieExt` extension and requires `CairoMakie`.
+"""
 function plot_chi_vs_paramvals end
 
+"""
+    plot_transitions(sweep_or_slice; kwargs...) -> Figure
+
+Plot transition energies from a one-dimensional [`ParameterSweep`](@ref) or a
+[`SweepSlice`](@ref).
+
+This plotting entry point is implemented by the `ScQubitsMimicMakieExt`
+extension and requires `CairoMakie`.
+"""
+function plot_transitions end
+
 export plot_evals_vs_paramvals, plot_matrixelements,
-       plot_wavefunction, plot_chi_vs_paramvals
+       plot_wavefunction, plot_chi_vs_paramvals, plot_transitions
 
 end # module

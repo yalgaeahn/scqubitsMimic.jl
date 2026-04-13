@@ -33,6 +33,15 @@ end
 
 const HierarchyNode = Union{HierarchyLeaf, HierarchyGroup}
 
+@doc """
+    HierarchyNode
+
+Union alias for hierarchy tree nodes used by [`configure!`](@ref),
+[`hierarchical_diag`](@ref), and [`truncation_template`](@ref).
+
+Valid values are [`HierarchyLeaf`](@ref) and [`HierarchyGroup`](@ref).
+""" HierarchyNode
+
 # ── HD truncation defaults ───────────────────────────────────────────────────
 
 """
@@ -210,6 +219,27 @@ struct LevelResult
     dressed_exp_builders::Dict{Int, Function}                    # ai => (c -> dressed exp(icθ))
 end
 
+mutable struct HDCacheNode
+    node::HierarchyNode
+    path::Tuple{Vararg{Int}}
+    mode_indices::Vector{Int}
+    children::Vector{HDCacheNode}
+    result::Union{Nothing, LevelResult}
+end
+
+mutable struct HierarchicalDiagCache
+    hierarchy::HierarchyGroup
+    trunc_dims::Dict{Tuple{Vararg{Int}}, Int}
+    ctx::Any
+    root::HDCacheNode
+    leaf_path_by_mode::Dict{Int, Tuple{Vararg{Int}}}
+    affected_modes_by_param::Dict{Symbol, Vector{Int}}
+    affected_leaf_paths_by_param::Dict{Symbol, Vector{Tuple{Vararg{Int}}}}
+end
+
+_path_is_prefix(prefix::Tuple{Vararg{Int}}, path::Tuple{Vararg{Int}}) =
+    length(prefix) <= length(path) && all(prefix[i] == path[i] for i in eachindex(prefix))
+
 # ── Conversion helpers ───────────────────────────────────────────────────────
 
 """Convert a nested `Vector` structure to `HierarchyNode`."""
@@ -253,6 +283,117 @@ struct HierarchyContext
     T_inv::Matrix{Float64}
     n_nodes::Int
     var_to_pos::Dict{Int,Int}           # variable index → position in active_modes/dims/mode_ops
+end
+
+function _build_hierarchy_context(circ::Circuit, hier::HierarchyGroup)
+    sc = circ.symbolic_circuit
+    vc = circ.var_categories
+    T = circ.transformation_matrix
+    T_inv = inv(T)
+    n_nodes = sc.graph.num_nodes
+    active_modes = vcat(vc.periodic, vc.extended)
+
+    all_modes = sort(_collect_modes(hier))
+    expected = sort(active_modes)
+    all_modes == expected ||
+        error("system_hierarchy must partition active variable indices $expected exactly. " *
+              "Got: $all_modes")
+
+    C_numeric = _build_capacitance_matrix_numeric(circ)
+    ec_float = inv(C_numeric) ./ 2
+    ec_transformed = T_inv' * ec_float * T_inv
+
+    L_inv_float = _build_inv_inductance_matrix_numeric(circ)
+    L_inv_transformed = T' * L_inv_float * T
+
+    dims = Int[circ.cutoffs[m] for m in active_modes]
+    mode_ops = _build_mode_operators(circ, active_modes, dims)
+    var_to_pos = Dict(mi => ai for (ai, mi) in enumerate(active_modes))
+
+    return HierarchyContext(circ, active_modes, dims, mode_ops,
+                            ec_transformed, L_inv_transformed, T_inv, n_nodes,
+                            var_to_pos)
+end
+
+function _build_hd_cache_node(node::HierarchyNode,
+                              path::Tuple{Vararg{Int}}=())
+    if node isa HierarchyLeaf
+        return HDCacheNode(node, path, copy(node.mode_indices), HDCacheNode[], nothing)
+    end
+
+    children = HDCacheNode[]
+    for (idx, child) in enumerate(node.children)
+        push!(children, _build_hd_cache_node(child, (path..., idx)))
+    end
+    return HDCacheNode(node, path, _collect_modes(node), children, nothing)
+end
+
+function _collect_leaf_paths!(leaf_path_by_mode::Dict{Int, Tuple{Vararg{Int}}},
+                              node::HDCacheNode)
+    if node.node isa HierarchyLeaf
+        for mode in node.mode_indices
+            leaf_path_by_mode[mode] = node.path
+        end
+        return leaf_path_by_mode
+    end
+
+    for child in node.children
+        _collect_leaf_paths!(leaf_path_by_mode, child)
+    end
+    return leaf_path_by_mode
+end
+
+function _build_hd_affected_modes(ctx::HierarchyContext)
+    circ = ctx.circ
+    sc = circ.symbolic_circuit
+    affected = Dict{Symbol, Set{Int}}()
+
+    for mode in circ.var_categories.periodic
+        affected[Symbol("ng$(mode)")] = Set([mode])
+    end
+
+    for (fi, ef) in enumerate(sc.external_fluxes)
+        pname = Symbol("Φ$(fi)")
+        modes = get!(affected, pname, Set{Int}())
+
+        for (bi, alloc) in enumerate(sc.branch_flux_allocations)
+            alloc_vars = Symbolics.get_variables(alloc)
+            any(v -> isequal(v, ef), alloc_vars) || continue
+
+            branch = sc.graph.branches[bi]
+            for mode in ctx.active_modes
+                abs(_branch_mode_coeff(branch, ctx.T_inv, mode)) > 1e-15 || continue
+                push!(modes, mode)
+            end
+        end
+
+        for (_, phase_sym) in sc.josephson_terms
+            phase_vars = Symbolics.get_variables(phase_sym)
+            any(v -> isequal(v, ef), phase_vars) || continue
+
+            coeffs, _ = _extract_phase_info(circ, phase_sym, ctx.T_inv,
+                                            ctx.n_nodes, ctx.active_modes)
+            for ai in keys(coeffs)
+                push!(modes, ctx.active_modes[ai])
+            end
+        end
+    end
+
+    return Dict(name => sort!(collect(modes)) for (name, modes) in affected)
+end
+
+function _build_hd_affected_leaf_paths(leaf_path_by_mode::Dict{Int, Tuple{Vararg{Int}}},
+                                       affected_modes_by_param::Dict{Symbol, Vector{Int}})
+    affected_leaf_paths = Dict{Symbol, Vector{Tuple{Vararg{Int}}}}()
+    for (param_name, modes) in affected_modes_by_param
+        paths = Tuple{Vararg{Int}}[]
+        for mode in modes
+            haskey(leaf_path_by_mode, mode) || continue
+            push!(paths, leaf_path_by_mode[mode])
+        end
+        affected_leaf_paths[param_name] = unique(paths)
+    end
+    return affected_leaf_paths
 end
 
 # ── Leaf diagonalization ─────────────────────────────────────────────────────
@@ -344,10 +485,8 @@ function _process_leaf(ctx::HierarchyContext, leaf::HierarchyLeaf, trunc_dim::In
 
     # ── Diagonalize ────────────────────────────────────────────────────────
     H_qobj = QuantumObject(sparse(H_sub))
-    result = eigenstates(H_qobj)
-    n_states = min(trunc_dim, length(result.values))
-    evals = real.(result.values[1:n_states])
-    evecs = result.vectors[:, 1:n_states]
+    evals, evecs = _lowest_hermitian_eigensystem(H_qobj, trunc_dim)
+    n_states = length(evals)
 
     # SubCircuit Hamiltonian: diagonal in truncated eigenbasis
     H_diag = QuantumObject(spdiagm(0 => ComplexF64.(evals)))
@@ -381,19 +520,9 @@ end
 
 # ── Intermediate group diagonalization ───────────────────────────────────────
 
-function _process_intermediate_group(ctx::HierarchyContext,
-                                      group::HierarchyGroup,
-                                      trunc_dim::Int,
-                                      path::Tuple{Vararg{Int}},
-                                      trunc_dims::Dict{Tuple{Vararg{Int}}, Int})
-    # ── Recursively process children ───────────────────────────────────────
-    child_results = LevelResult[]
-    for (ci, child) in enumerate(group.children)
-        child_path = (path..., ci)
-        r = _process_node(ctx, child, child_path, trunc_dims)
-        push!(child_results, r)
-    end
-
+function _build_intermediate_group_result(ctx::HierarchyContext,
+                                          child_results::Vector{LevelResult},
+                                          trunc_dim::Int)
     n_children = length(child_results)
     child_dims = [hilbertdim(r.subcircuit) for r in child_results]
     combined_dim = prod(child_dims)
@@ -490,10 +619,8 @@ function _process_intermediate_group(ctx::HierarchyContext,
 
     # ── Diagonalize combined system ────────────────────────────────────────
     H_qobj = QuantumObject(sparse(H_combined))
-    result = eigenstates(H_qobj)
-    n_states = min(trunc_dim, length(result.values))
-    evals = real.(result.values[1:n_states])
-    evecs = result.vectors[:, 1:n_states]
+    evals, evecs = _lowest_hermitian_eigensystem(H_qobj, trunc_dim)
+    n_states = length(evals)
 
     # SubCircuit
     H_diag = QuantumObject(spdiagm(0 => ComplexF64.(evals)))
@@ -526,6 +653,22 @@ function _process_intermediate_group(ctx::HierarchyContext,
                        new_dressed_exp)
 end
 
+function _process_intermediate_group(ctx::HierarchyContext,
+                                      group::HierarchyGroup,
+                                      trunc_dim::Int,
+                                      path::Tuple{Vararg{Int}},
+                                      trunc_dims::Dict{Tuple{Vararg{Int}}, Int})
+    # ── Recursively process children ───────────────────────────────────────
+    child_results = LevelResult[]
+    for (ci, child) in enumerate(group.children)
+        child_path = (path..., ci)
+        r = _process_node(ctx, child, child_path, trunc_dims)
+        push!(child_results, r)
+    end
+
+    return _build_intermediate_group_result(ctx, child_results, trunc_dim)
+end
+
 # ── Node dispatcher ──────────────────────────────────────────────────────────
 
 function _process_node(ctx::HierarchyContext, node::HierarchyLeaf,
@@ -540,6 +683,197 @@ function _process_node(ctx::HierarchyContext, node::HierarchyGroup,
                        trunc_dims::Dict{Tuple{Vararg{Int}}, Int})
     td = trunc_dims[path]
     return _process_intermediate_group(ctx, node, td, path, trunc_dims)
+end
+
+function _build_top_level_hilbertspace(ctx::HierarchyContext,
+                                       child_results::Vector{LevelResult})
+    circ = ctx.circ
+    sc = circ.symbolic_circuit
+    n_children = length(child_results)
+    subcircuits = [r.subcircuit for r in child_results]
+
+    hs = HilbertSpace(collect(AbstractQuantumSystem, subcircuits))
+    dims_trunc = [hilbertdim(sc_i) for sc_i in subcircuits]
+
+    for cA in 1:n_children
+        for cB in (cA+1):n_children
+            for viA in child_results[cA].all_mode_indices
+                for viB in child_results[cB].all_mode_indices
+                    ec_val = ctx.ec_transformed[viA, viB]
+                    abs(ec_val) < 1e-15 && continue
+
+                    nA_qobj = QuantumObject(sparse(child_results[cA].dressed_n_ops[viA]))
+                    nB_qobj = QuantumObject(sparse(child_results[cB].dressed_n_ops[viB]))
+                    scA = subcircuits[cA]
+                    scB = subcircuits[cB]
+
+                    add_interaction!(hs, 2 * 4 * ec_val,
+                        [scA, scB],
+                        [_ -> nA_qobj, _ -> nB_qobj])
+                end
+            end
+        end
+    end
+
+    for cA in 1:n_children
+        for cB in (cA+1):n_children
+            for viA in child_results[cA].all_mode_indices
+                for viB in child_results[cB].all_mode_indices
+                    l_val = ctx.L_inv_transformed[viA, viB]
+                    abs(l_val) < 1e-15 && continue
+
+                    phiA_qobj = QuantumObject(sparse(child_results[cA].dressed_phi_ops[viA]))
+                    phiB_qobj = QuantumObject(sparse(child_results[cB].dressed_phi_ops[viB]))
+                    scA = subcircuits[cA]
+                    scB = subcircuits[cB]
+
+                    add_interaction!(hs, 2 * 0.5 * l_val,
+                        [scA, scB],
+                        [_ -> phiA_qobj, _ -> phiB_qobj])
+                end
+            end
+        end
+    end
+
+    ej_current_vals = _get_josephson_ej_values(circ)
+    for (jj_idx, (_, phase_sym)) in enumerate(sc.josephson_terms)
+        ej_val = ej_current_vals[jj_idx]
+        phase_coeffs, ext_phase = _extract_phase_info(circ, phase_sym, ctx.T_inv,
+                                                       ctx.n_nodes, ctx.active_modes)
+        var_coeffs = Dict(ctx.active_modes[ai] => c for (ai, c) in phase_coeffs)
+        children_involved = Dict{Int, Vector{Tuple{Int, Float64}}}()
+        for (vi, c) in var_coeffs
+            ci = findfirst(r -> vi in r.all_mode_indices, child_results)
+            ci === nothing && continue
+            if !haskey(children_involved, ci)
+                children_involved[ci] = Tuple{Int, Float64}[]
+            end
+            push!(children_involved[ci], (vi, c))
+        end
+
+        length(children_involved) <= 1 && continue
+
+        dressed_exp_per_child = Vector{SparseMatrixCSC{ComplexF64, Int}}(undef, n_children)
+        for ci in 1:n_children
+            d = dims_trunc[ci]
+            if !haskey(children_involved, ci)
+                dressed_exp_per_child[ci] = sparse(ComplexF64(1.0) * I, d, d)
+            else
+                child_exp = sparse(ComplexF64(1.0) * I, d, d)
+                for (vi, c) in children_involved[ci]
+                    child_exp = child_exp * child_results[ci].dressed_exp_builders[vi](c)
+                end
+                dressed_exp_per_child[ci] = child_exp
+            end
+        end
+
+        full_exp = reduce(kron, dressed_exp_per_child) * exp(1im * ext_phase)
+        cos_op_full = (full_exp + full_exp') / 2
+        add_operator!(hs, QuantumObject(sparse(-ej_val * cos_op_full),
+                                        dims=Tuple(dims_trunc)))
+    end
+
+    cg = sc.graph
+    total_hs_dim = prod(dims_trunc)
+    for (bi, b) in enumerate(cg.branches)
+        b.branch_type == L_branch || continue
+        el = _get_branch_param(circ, bi, :EL)
+        phi_ext_val = _eval_branch_ext_flux(circ, bi)
+        abs(phi_ext_val) < 1e-15 && continue
+        shift = (el / 2) * phi_ext_val^2
+        I_full = sparse(ComplexF64(1.0) * I, total_hs_dim, total_hs_dim)
+        add_operator!(hs, QuantumObject(shift * I_full, dims=Tuple(dims_trunc)))
+    end
+
+    return hs
+end
+
+function _populate_hd_cache_node!(cache::HierarchicalDiagCache, node::HDCacheNode)
+    if node.node isa HierarchyLeaf
+        node.result = _process_leaf(cache.ctx, node.node, cache.trunc_dims[node.path])
+        return node.result
+    end
+
+    for child in node.children
+        _populate_hd_cache_node!(cache, child)
+    end
+
+    if !isempty(node.path)
+        child_results = LevelResult[child.result for child in node.children]
+        node.result = _build_intermediate_group_result(cache.ctx, child_results,
+                                                       cache.trunc_dims[node.path])
+    end
+    return node.result
+end
+
+function _build_hierarchical_cache(circ::Circuit; system_hierarchy, subsystem_trunc_dims)
+    hier = _to_hierarchy_group(system_hierarchy)
+    td = _subsystem_trunc_dims_to_path_dict(hier, subsystem_trunc_dims)
+    ctx = _build_hierarchy_context(circ, hier)
+    root = _build_hd_cache_node(hier)
+    cache = HierarchicalDiagCache(hier, td, ctx, root,
+                                  Dict{Int, Tuple{Vararg{Int}}}(),
+                                  Dict{Symbol, Vector{Int}}(),
+                                  Dict{Symbol, Vector{Tuple{Vararg{Int}}}}())
+
+    for child in cache.root.children
+        _populate_hd_cache_node!(cache, child)
+    end
+
+    _collect_leaf_paths!(cache.leaf_path_by_mode, cache.root)
+    cache.affected_modes_by_param = _build_hd_affected_modes(ctx)
+    cache.affected_leaf_paths_by_param = _build_hd_affected_leaf_paths(
+        cache.leaf_path_by_mode, cache.affected_modes_by_param)
+
+    child_results = LevelResult[child.result for child in cache.root.children]
+    hs = _build_top_level_hilbertspace(ctx, child_results)
+    return cache, hs
+end
+
+function _refresh_hd_cache_node!(cache::HierarchicalDiagCache,
+                                 node::HDCacheNode,
+                                 dirty_leaf_paths::Vector{Tuple{Vararg{Int}}})
+    any(path -> _path_is_prefix(node.path, path), dirty_leaf_paths) || return node.result
+
+    if node.node isa HierarchyLeaf
+        node.result = _process_leaf(cache.ctx, node.node, cache.trunc_dims[node.path])
+        return node.result
+    end
+
+    for child in node.children
+        _refresh_hd_cache_node!(cache, child, dirty_leaf_paths)
+    end
+
+    child_results = LevelResult[child.result for child in node.children]
+    node.result = _build_intermediate_group_result(cache.ctx, child_results,
+                                                   cache.trunc_dims[node.path])
+    return node.result
+end
+
+function _refresh_configured_hierarchical!(circ::Circuit, param_name::Symbol)
+    cache = circ._hd_cache
+    cache isa HierarchicalDiagCache || return circ
+
+    dirty_leaf_paths = get(cache.affected_leaf_paths_by_param, param_name,
+                           Tuple{Vararg{Int}}[])
+    for child in cache.root.children
+        _refresh_hd_cache_node!(cache, child, dirty_leaf_paths)
+    end
+
+    child_results = LevelResult[child.result for child in cache.root.children]
+    hs = _build_top_level_hilbertspace(cache.ctx, child_results)
+    circ._hilbert_space = hs
+    circ._subsystems = SubCircuit[s for s in hs.subsystems]
+    circ._hd_cache = cache
+    return circ
+end
+
+function _configure_hierarchical_cache!(circ::Circuit; system_hierarchy, subsystem_trunc_dims)
+    cache, hs = _build_hierarchical_cache(circ;
+        system_hierarchy=system_hierarchy,
+        subsystem_trunc_dims=subsystem_trunc_dims)
+    circ._hd_cache = cache
+    return hs
 end
 
 # ── Top-level entry point (new recursive API) ────────────────────────────────
@@ -579,153 +913,8 @@ A `HilbertSpace` whose subsystems are truncated `SubCircuit`s with
 cross-coupling interaction terms.
 """
 function hierarchical_diag(circ::Circuit; system_hierarchy, subsystem_trunc_dims)
-    # ── Normalize inputs ───────────────────────────────────────────────────
-    hier = _to_hierarchy_group(system_hierarchy)
-
-    td = _subsystem_trunc_dims_to_path_dict(hier, subsystem_trunc_dims)
-    sc = circ.symbolic_circuit
-    vc = circ.var_categories
-    T = circ.transformation_matrix
-    T_inv = inv(T)
-    n_nodes = sc.graph.num_nodes
-    active_modes = vcat(vc.periodic, vc.extended)
-    n_active = length(active_modes)
-
-    # ── Validate hierarchy ─────────────────────────────────────────────────
-    all_modes = sort(_collect_modes(hier))
-    expected = sort(active_modes)
-    all_modes == expected ||
-        error("system_hierarchy must partition active variable indices $expected exactly. " *
-              "Got: $all_modes")
-
-    # ── Transformed matrices ───────────────────────────────────────────────
-    C_numeric = _build_capacitance_matrix_numeric(circ)
-    ec_float = inv(C_numeric) ./ 2
-    ec_transformed = T_inv' * ec_float * T_inv
-
-    L_inv_float = _build_inv_inductance_matrix_numeric(circ)
-    L_inv_transformed = T' * L_inv_float * T
-
-    dims = Int[circ.cutoffs[m] for m in active_modes]
-    mode_ops = _build_mode_operators(circ, active_modes, dims)
-
-    var_to_pos = Dict(mi => ai for (ai, mi) in enumerate(active_modes))
-    ctx = HierarchyContext(circ, active_modes, dims, mode_ops,
-                           ec_transformed, L_inv_transformed, T_inv, n_nodes,
-                           var_to_pos)
-
-    # ── Process top-level children ─────────────────────────────────────────
-    child_results = LevelResult[]
-    for (ci, child) in enumerate(hier.children)
-        child_path = (ci,)
-        r = _process_node(ctx, child, child_path, td)
-        push!(child_results, r)
-    end
-
-    n_children = length(child_results)
-    subcircuits = [r.subcircuit for r in child_results]
-
-    # ── Build HilbertSpace ─────────────────────────────────────────────────
-    hs = HilbertSpace(collect(AbstractQuantumSystem, subcircuits))
-    dims_trunc = [hilbertdim(sc_i) for sc_i in subcircuits]
-
-    # ── Cross-child capacitive couplings (factor 2 for symmetric sum) ──────
-    for cA in 1:n_children
-        for cB in (cA+1):n_children
-            for viA in child_results[cA].all_mode_indices
-                for viB in child_results[cB].all_mode_indices
-                    ec_val = ec_transformed[viA, viB]
-                    abs(ec_val) < 1e-15 && continue
-
-                    nA_qobj = QuantumObject(sparse(child_results[cA].dressed_n_ops[viA]))
-                    nB_qobj = QuantumObject(sparse(child_results[cB].dressed_n_ops[viB]))
-                    scA = subcircuits[cA]
-                    scB = subcircuits[cB]
-
-                    add_interaction!(hs, 2 * 4 * ec_val,
-                        [scA, scB],
-                        [_ -> nA_qobj, _ -> nB_qobj])
-                end
-            end
-        end
-    end
-
-    # ── Cross-child inductive couplings (factor 2 for symmetric sum) ───────
-    for cA in 1:n_children
-        for cB in (cA+1):n_children
-            for viA in child_results[cA].all_mode_indices
-                for viB in child_results[cB].all_mode_indices
-                    l_val = L_inv_transformed[viA, viB]
-                    abs(l_val) < 1e-15 && continue
-
-                    phiA_qobj = QuantumObject(sparse(child_results[cA].dressed_phi_ops[viA]))
-                    phiB_qobj = QuantumObject(sparse(child_results[cB].dressed_phi_ops[viB]))
-                    scA = subcircuits[cA]
-                    scB = subcircuits[cB]
-
-                    add_interaction!(hs, 2 * 0.5 * l_val,
-                        [scA, scB],
-                        [_ -> phiA_qobj, _ -> phiB_qobj])
-                end
-            end
-        end
-    end
-
-    # ── Cross-child Josephson couplings ────────────────────────────────────
-    ej_current_vals = _get_josephson_ej_values(circ)
-    for (jj_idx, (ej_sym, phase_sym)) in enumerate(sc.josephson_terms)
-        ej_val = ej_current_vals[jj_idx]
-        phase_coeffs, ext_phase = _extract_phase_info(circ, phase_sym, T_inv,
-                                                       n_nodes, active_modes)
-        # Re-key from active-mode position to variable index
-        var_coeffs = Dict(active_modes[ai] => c for (ai, c) in phase_coeffs)
-        # Map modes to top-level children
-        children_involved = Dict{Int, Vector{Tuple{Int, Float64}}}()
-        for (vi, c) in var_coeffs
-            ci = findfirst(r -> vi in r.all_mode_indices, child_results)
-            ci === nothing && continue
-            if !haskey(children_involved, ci)
-                children_involved[ci] = Tuple{Int, Float64}[]
-            end
-            push!(children_involved[ci], (vi, c))
-        end
-
-        length(children_involved) <= 1 && continue
-
-        # Build per-child exp operators
-        dressed_exp_per_child = Vector{SparseMatrixCSC{ComplexF64, Int}}(undef, n_children)
-        for ci in 1:n_children
-            d = dims_trunc[ci]
-            if !haskey(children_involved, ci)
-                dressed_exp_per_child[ci] = sparse(ComplexF64(1.0) * I, d, d)
-            else
-                child_exp = sparse(ComplexF64(1.0) * I, d, d)
-                for (vi, c) in children_involved[ci]
-                    child_exp = child_exp * child_results[ci].dressed_exp_builders[vi](c)
-                end
-                dressed_exp_per_child[ci] = child_exp
-            end
-        end
-
-        full_exp = reduce(kron, dressed_exp_per_child) * exp(1im * ext_phase)
-        cos_op_full = (full_exp + full_exp') / 2
-
-        add_operator!(hs, QuantumObject(sparse(-ej_val * cos_op_full),
-                                        dims=Tuple(dims_trunc)))
-    end
-
-    # ── Inductive external flux: constant energy shift ─────────────────────
-    cg = sc.graph
-    total_hs_dim = prod(dims_trunc)
-    for (bi, b) in enumerate(cg.branches)
-        b.branch_type == L_branch || continue
-        el = _get_branch_param(circ, bi, :EL)
-        phi_ext_val = _eval_branch_ext_flux(circ, bi)
-        abs(phi_ext_val) < 1e-15 && continue
-        shift = (el / 2) * phi_ext_val^2
-        I_full = sparse(ComplexF64(1.0) * I, total_hs_dim, total_hs_dim)
-        add_operator!(hs, QuantumObject(shift * I_full, dims=Tuple(dims_trunc)))
-    end
-
+    _, hs = _build_hierarchical_cache(circ;
+        system_hierarchy=system_hierarchy,
+        subsystem_trunc_dims=subsystem_trunc_dims)
     return hs
 end

@@ -1,7 +1,15 @@
 using Test
 using LinearAlgebra
 using SparseArrays
+using CairoMakie
 using ScQubitsMimic
+
+function dense_lowest_eigensys(sys, evals_count)
+    H = Hermitian(Matrix(hamiltonian(sys).data))
+    n = min(evals_count, size(H, 1))
+    result = eigen(H, 1:n)
+    return Float64.(result.values), ComplexF64.(result.vectors)
+end
 
 @testset "ScQubitsMimic.jl" begin
 
@@ -43,6 +51,12 @@ using ScQubitsMimic
         ω01 = evals[2] - evals[1]
         ω_approx = sqrt(8 * t.EJ * t.EC) - t.EC
         @test abs(ω01 - ω_approx) / ω_approx < 0.05
+
+        t_ng = Transmon(EJ=18.0, EC=0.9, ng=0.23, ncut=14, truncated_dim=5)
+        evals_ref, evecs_ref = dense_lowest_eigensys(t_ng, 4)
+        evals_fast, evecs_fast = eigensys(t_ng; evals_count=4)
+        @test evals_fast ≈ evals_ref atol=1e-10
+        @test abs.(diag(evecs_fast' * evecs_ref)) ≈ ones(4) atol=1e-8
     end
 
     @testset "Oscillator" begin
@@ -159,6 +173,12 @@ branches:
         tt4 = TunableTransmon(EJmax=30.0, EC=1.2, d=0.0, flux=0.0, ncut=30, truncated_dim=4)
         t_ref = Transmon(EJ=30.0, EC=1.2, ng=0.0, ncut=30, truncated_dim=4)
         @test eigenvals(tt4; evals_count=4) ≈ eigenvals(t_ref; evals_count=4) atol=1e-10
+
+        tt5 = TunableTransmon(EJmax=24.0, EC=0.8, d=0.17, flux=0.31, ng=0.11, ncut=15, truncated_dim=5)
+        evals_ref, evecs_ref = dense_lowest_eigensys(tt5, 4)
+        evals_fast, evecs_fast = eigensys(tt5; evals_count=4)
+        @test evals_fast ≈ evals_ref atol=1e-10
+        @test abs.(diag(evecs_fast' * evecs_ref)) ≈ ones(4) atol=1e-8
     end
 
     @testset "Circuit flux sweep via set_param!" begin
@@ -176,6 +196,25 @@ branches:
         @test w01_0 > w01_pi
         @test w01_0 > 5.0   # should be well in transmon regime
         @test w01_pi < 3.0   # near charge regime at frustration
+
+        for (idx, phi) in enumerate([0.0, Float64(π)])
+            set_param!(circ, Symbol("Φ1"), phi)
+            @test sd.eigenvalues[idx, :] ≈ eigenvals(circ; evals_count=3) atol=1e-10
+        end
+    end
+
+    @testset "Circuit low-energy ordering uses algebraic eigenvalues" begin
+        desc = """
+branches:
+  - [JJ, 0, 1, EJ=18.0, EC=0.25]
+  - [C, 0, 1, EC=0.4]
+"""
+        circ = Circuit(desc; ncut=12)
+        evals = eigenvals(circ; evals_count=3)
+        evals_ref, _ = dense_lowest_eigensys(circ, 3)
+        @test evals ≈ evals_ref atol=1e-10
+        @test issorted(evals)
+        @test evals[1] < 0.0
     end
 
     @testset "Circuit scqubits-style indexed parameters" begin
@@ -218,9 +257,9 @@ branches:
         @test loops_sc == [[(2, 1), (1, 1)], [(6, 1), (5, 1)], [(10, 1), (9, 1)]]
         @test floops[end] == [(12, 1), (4, -1), (8, -1)]
 
-        @test occursin("Φ1", string(sym_hamiltonian(circ)))
+        @test occursin("Φ1", string(sym_hamiltonian(circ; return_expr=true)))
         @test occursin("Φ1", string(sym_hamiltonian_node(circ)))
-        @test !occursin("Φext", string(sym_hamiltonian(circ)))
+        @test !occursin("Φext", string(sym_hamiltonian(circ; return_expr=true)))
         @test !occursin("Φext", string(sym_hamiltonian_node(circ)))
 
         set_param!(circ, Symbol("Φ2"), 0.3)
@@ -238,7 +277,7 @@ branches:
         @test sd_str.param_name == Symbol("Φ2")
         @test sd_str.eigenvalues ≈ sd_sym.eigenvalues
 
-        ps = ParameterSweep(circ, "Φ2", phi_vals; evals_count=2)
+        ps = SingleSystemSweep(circ, "Φ2", phi_vals; evals_count=2)
         @test ps.param_name == Symbol("Φ2")
 
         @test_throws ErrorException set_param!(circ, Symbol("Φext_2"), 0.1)
@@ -351,6 +390,7 @@ branches:
         for i in 1:8
             bi = bare_index(hs, i)
             @test dressed_index(hs, bi...) == i
+            @test dressed_index(hs, bi) == i
         end
 
         # energy_by_dressed_index should match dressed_evals
@@ -360,6 +400,36 @@ branches:
 
         # energy_by_bare_index should give same result
         @test energy_by_bare_index(hs, 1, 1) ≈ lookup.dressed_evals[1]
+        @test energy_by_bare_index(hs, (1, 1); subtract_ground=true) ≈ 0.0 atol=1e-12
+    end
+
+    @testset "SpectrumLookup from precomputed eigensystems" begin
+        t = Transmon(EJ=28.0, EC=1.1, ng=0.0, ncut=10, truncated_dim=3)
+        osc = Oscillator(E_osc=5.5, truncated_dim=4)
+        hs = HilbertSpace([t, osc])
+        add_interaction!(hs, 0.08, [t, osc],
+            [s -> n_operator(t),
+             s -> annihilation_operator(s) + creation_operator(s)])
+
+        direct_lookup = generate_lookup!(hs; evals_count=8)
+        dressed_vals, dressed_vecs = eigensys(hs; evals_count=8)
+        bare_evals = Vector{Vector{Float64}}(undef, length(hs.subsystems))
+        bare_evecs = Vector{Matrix{ComplexF64}}(undef, length(hs.subsystems))
+        for (i, subsystem) in enumerate(hs.subsystems)
+            vals, vecs = eigensys(subsystem; evals_count=hilbertdim(subsystem))
+            bare_evals[i] = vals
+            bare_evecs[i] = vecs
+        end
+
+        cached_lookup = ScQubitsMimic._build_lookup_from_spectral_data(
+            hs, dressed_vals, dressed_vecs, bare_evals, bare_evecs)
+
+        @test cached_lookup.dressed_evals ≈ direct_lookup.dressed_evals atol=1e-12
+        @test cached_lookup.overlap_matrix ≈ direct_lookup.overlap_matrix atol=1e-12
+        @test cached_lookup.bare_to_dressed == direct_lookup.bare_to_dressed
+        @test cached_lookup.dressed_to_bare == direct_lookup.dressed_to_bare
+        @test ScQubitsMimic._canonical_dressed_indices(cached_lookup) ==
+              ScQubitsMimic._canonical_dressed_indices(direct_lookup)
     end
 
     @testset "SpectrumLookup labeling policy" begin
@@ -373,6 +443,8 @@ branches:
         strict_lookup = generate_lookup!(hs_strict; evals_count=9)
         @test get(strict_lookup.bare_to_dressed, (1, 2), nothing) === nothing
         @test get(strict_lookup.bare_to_dressed, (2, 1), nothing) === nothing
+        @test dressed_index(hs_strict, 1, 2) === nothing
+        @test isnan(energy_by_bare_index(hs_strict, 1, 2))
 
         osc1_relaxed = Oscillator(E_osc=5.0, truncated_dim=3)
         osc2_relaxed = Oscillator(E_osc=5.0, truncated_dim=3)
@@ -384,6 +456,19 @@ branches:
         relaxed_lookup = generate_lookup!(hs_relaxed; evals_count=9)
         @test haskey(relaxed_lookup.bare_to_dressed, (1, 2))
         @test haskey(relaxed_lookup.bare_to_dressed, (2, 1))
+    end
+
+    @testset "SpectrumLookup ordering schemes" begin
+        osc1 = Oscillator(E_osc=1.0, truncated_dim=3)
+        osc2 = Oscillator(E_osc=1.7, truncated_dim=3)
+        hs = HilbertSpace([osc1, osc2])
+
+        lx_lookup = generate_lookup!(hs; evals_count=9, ordering=:LX)
+        expected_labels = vec(collect(Iterators.product(1:3, 1:3)))
+        @test sort(collect(keys(lx_lookup.bare_to_dressed))) == sort(expected_labels)
+
+        be_lookup = generate_lookup!(hs; evals_count=9, ordering=:BE, BEs_count=4)
+        @test sort(collect(keys(be_lookup.bare_to_dressed))) == [(1, 1), (1, 2), (2, 1), (3, 1)]
     end
 
     @testset "op_in_dressed_eigenbasis" begin
@@ -405,17 +490,53 @@ branches:
         for i in 1:8
             @test real(H_dressed[i, i]) ≈ hs.lookup.dressed_evals[i] atol=1e-10
         end
+
+        dims = [hilbertdim(s) for s in hs.subsystems]
+        n_full = identity_wrap(n_operator(t), 1, dims).data
+        n_full_dressed = op_in_dressed_eigenbasis(hs, n_full; truncated_dim=8)
+        n_tuple_dressed = op_in_dressed_eigenbasis(hs, (n_operator(t), t); truncated_dim=8)
+        @test n_tuple_dressed ≈ n_full_dressed atol=1e-10
+
+        n_bare = matrixelement_table(t, n_operator(t); evals_count=hilbertdim(t))
+        n_tuple_bare = op_in_dressed_eigenbasis(
+            hs, (n_bare, t); truncated_dim=8, op_in_bare_eigenbasis=true)
+        @test n_tuple_bare ≈ n_full_dressed atol=1e-10
+
+        a_callable_dressed = op_in_dressed_eigenbasis(hs, annihilation_operator; truncated_dim=8)
+        a_tuple_dressed = op_in_dressed_eigenbasis(
+            hs, (annihilation_operator(osc), osc); truncated_dim=8)
+        @test a_callable_dressed ≈ a_tuple_dressed atol=1e-10
     end
 
-    @testset "HilbertSpaceSweep" begin
+    @testset "ParameterSweep rename regression" begin
         tmon = TunableTransmon(EJmax=20.0, EC=0.3, d=0.0, flux=0.0, ncut=10, truncated_dim=3)
         osc = Oscillator(E_osc=6.0, truncated_dim=4)
         hs = HilbertSpace([tmon, osc])
 
-        sweep = HilbertSpaceSweep(hs,
+        sweep = ParameterSweep(hs,
+            Dict(:flux => [0.0, 0.25]),
+            (hs, vals) -> begin
+                hs.subsystems[1].flux = vals[:flux]
+            end;
+            evals_count=4)
+
+        @test sweep isa ParameterSweep
+        @test !isdefined(ScQubitsMimic, :HilbertSpaceSweep)
+
+        bare = SingleSystemSweep(tmon, :flux, [0.0, 0.25]; evals_count=3)
+        @test bare isa SingleSystemSweep
+        @test bare.param_name == :flux
+    end
+
+    @testset "ParameterSweep" begin
+        tmon = TunableTransmon(EJmax=20.0, EC=0.3, d=0.0, flux=0.0, ncut=10, truncated_dim=3)
+        osc = Oscillator(E_osc=6.0, truncated_dim=4)
+        hs = HilbertSpace([tmon, osc])
+
+        sweep = ParameterSweep(hs,
             Dict(:flux => [0.0, 0.25, 0.5]),
             (hs, vals) -> begin
-                tmon.flux = vals[:flux]
+                hs.subsystems[1].flux = vals[:flux]
             end;
             evals_count=4
         )
@@ -427,7 +548,7 @@ branches:
         @test w01_0 > w01_half
     end
 
-    @testset "HilbertSpaceSweep labeling policy" begin
+    @testset "ParameterSweep labeling policy" begin
         osc1 = Oscillator(E_osc=5.0, truncated_dim=3)
         osc2 = Oscillator(E_osc=5.0, truncated_dim=3)
         hs = HilbertSpace([osc1, osc2]; ignore_low_overlap=true)
@@ -437,36 +558,333 @@ branches:
 
         # Sweep defaults remain strict even when the source HilbertSpace
         # uses relaxed single-point lookup labeling.
-        default_sweep = HilbertSpaceSweep(hs,
+        default_sweep = ParameterSweep(hs,
             Dict(:ω2 => [5.0]),
             (hs, vals) -> begin
-                osc2.E_osc = vals[:ω2]
+                hs.subsystems[2].E_osc = vals[:ω2]
             end;
-            evals_count=9,
-            store_lookups=true)
+            evals_count=9)
 
         # Relaxed sweep labeling is explicit and independent.
-        relaxed_sweep = HilbertSpaceSweep(hs,
+        relaxed_sweep = ParameterSweep(hs,
             Dict(:ω2 => [5.0]),
             (hs, vals) -> begin
-                osc2.E_osc = vals[:ω2]
+                hs.subsystems[2].E_osc = vals[:ω2]
             end;
             evals_count=9,
-            store_lookups=true,
             ignore_low_overlap=true)
 
         @test hs.ignore_low_overlap
         @test default_sweep.ignore_low_overlap == false
         @test relaxed_sweep.ignore_low_overlap
+        @test default_sweep.bare_evecs !== nothing
+        @test default_sweep.dressed_evecs !== nothing
+        @test default_sweep.dressed_indices !== nothing
         @test default_sweep.lookups !== nothing
         @test relaxed_sweep.lookups !== nothing
         @test get(default_sweep.lookups[1].bare_to_dressed, (1, 2), nothing) === nothing
         @test haskey(relaxed_sweep.lookups[1].bare_to_dressed, (1, 2))
+        @test default_sweep.lookups[1].dressed_evecs === default_sweep.dressed_evecs[1]
+        @test relaxed_sweep.lookups[1].dressed_evecs === relaxed_sweep.dressed_evecs[1]
+        @test default_sweep.dressed_indices[1] == ScQubitsMimic._canonical_dressed_indices(default_sweep.lookups[1])
+        @test relaxed_sweep.dressed_indices[1] == ScQubitsMimic._canonical_dressed_indices(relaxed_sweep.lookups[1])
 
         # Sweep-based dispersive analysis follows the sweep lookup policy only.
         @test_throws ErrorException chi_matrix(default_sweep)
         chi_relaxed = chi_matrix(relaxed_sweep)
         @test size(chi_relaxed) == (1, 2, 2)
+    end
+
+    @testset "ParameterSweep bare_only / autorun / deepcopy / subsys_update_info" begin
+        tmon = TunableTransmon(EJmax=20.0, EC=0.3, d=0.0, flux=0.0, ncut=10, truncated_dim=3)
+        osc = Oscillator(E_osc=6.0, truncated_dim=4)
+        hs = HilbertSpace([tmon, osc])
+
+        bare_only_sweep = ParameterSweep(hs,
+            Dict(:flux => [0.0, 0.25]),
+            (hs, vals) -> begin
+                hs.subsystems[1].flux = vals[:flux]
+            end;
+            evals_count=5,
+            bare_only=true)
+        @test bare_only_sweep.dressed_evals === nothing
+        @test bare_only_sweep.dressed_evecs === nothing
+        @test bare_only_sweep.dressed_indices === nothing
+        @test bare_only_sweep.lookups === nothing
+        @test bare_only_sweep.bare_evals !== nothing
+        @test bare_only_sweep.bare_evecs !== nothing
+        @test_throws ErrorException chi_matrix(bare_only_sweep)
+
+        autorun_sweep = ParameterSweep(hs,
+            Dict(:flux => [0.0, 0.25]),
+            (hs, vals) -> begin
+                hs.subsystems[1].flux = vals[:flux]
+            end;
+            evals_count=4,
+            autorun=false)
+        @test autorun_sweep.dressed_evals === nothing
+        @test autorun_sweep.bare_evals === nothing
+        @test autorun_sweep.bare_evecs === nothing
+        run!(autorun_sweep)
+        @test size(autorun_sweep.dressed_evals) == (2, 4)
+        @test autorun_sweep.dressed_evecs !== nothing
+        @test autorun_sweep.dressed_indices !== nothing
+        @test autorun_sweep.lookups !== nothing
+        @test autorun_sweep.lookups[1].dressed_evecs === autorun_sweep.dressed_evecs[1]
+
+        tmon_dc = TunableTransmon(EJmax=20.0, EC=0.3, d=0.0, flux=0.0, ncut=10, truncated_dim=3)
+        osc_dc = Oscillator(E_osc=6.0, truncated_dim=4)
+        hs_dc = HilbertSpace([tmon_dc, osc_dc])
+        sweep_dc = ParameterSweep(hs_dc,
+            Dict(:flux => [0.0, 0.25]),
+            (hs, vals) -> begin
+                hs.subsystems[1].flux = vals[:flux]
+            end;
+            evals_count=4,
+            deepcopy=true)
+        @test hs_dc.subsystems[1].flux == 0.0
+        @test sweep_dc.hilbertspace !== hs_dc
+        @test sweep_dc.hilbertspace.subsystems[1].flux == 0.25
+
+        osc_a = Oscillator(E_osc=5.0, truncated_dim=3)
+        osc_b = Oscillator(E_osc=6.0, truncated_dim=3)
+        hs_info = HilbertSpace([osc_a, osc_b])
+        sweep_info = ParameterSweep(hs_info,
+            Dict(:ωa => [5.0, 5.2], :ωb => [6.0, 6.3]),
+            (hs, vals) -> begin
+                hs.subsystems[1].E_osc = vals[:ωa]
+                hs.subsystems[2].E_osc = vals[:ωb]
+            end;
+            evals_count=4,
+            subsys_update_info=Dict(:ωa => [osc_a], :ωb => [osc_b]),
+            bare_only=true)
+        fast_param = sweep_info.param_order[1]
+        fast_subsys = only(sweep_info.subsys_update_info[fast_param])
+        slow_subsys = only(sweep_info.subsys_update_info[sweep_info.param_order[2]])
+        @test sweep_info.bare_evals[1][fast_subsys] !== sweep_info.bare_evals[2][fast_subsys]
+        @test sweep_info.bare_evals[1][slow_subsys] === sweep_info.bare_evals[2][slow_subsys]
+        @test sweep_info.bare_evecs[1][fast_subsys] !== sweep_info.bare_evecs[2][fast_subsys]
+        @test sweep_info.bare_evecs[1][slow_subsys] === sweep_info.bare_evecs[2][slow_subsys]
+    end
+
+    @testset "ParameterSweep labeling scheme keywords" begin
+        osc1 = Oscillator(E_osc=5.0, truncated_dim=2)
+        osc2 = Oscillator(E_osc=6.0, truncated_dim=2)
+        hs = HilbertSpace([osc1, osc2])
+        add_interaction!(hs, 0.05, [osc1, osc2],
+            [s -> annihilation_operator(s) + creation_operator(s),
+             s -> annihilation_operator(s) + creation_operator(s)])
+
+        sweep_lx = ParameterSweep(hs,
+            Dict(:ω2 => [6.0]),
+            (hs, vals) -> begin
+                hs.subsystems[2].E_osc = vals[:ω2]
+            end;
+            evals_count=4,
+            labeling_scheme=:LX,
+            labeling_subsys_priority=[2, 1])
+        @test sweep_lx.labeling_scheme == :LX
+        @test sweep_lx.labeling_subsys_priority == [2, 1]
+        @test sweep_lx.dressed_indices !== nothing
+        @test sweep_lx.lookups !== nothing
+        @test length(sweep_lx.lookups[1].bare_to_dressed) == 4
+
+        sweep_be = ParameterSweep(hs,
+            Dict(:ω2 => [6.0]),
+            (hs, vals) -> begin
+                hs.subsystems[2].E_osc = vals[:ω2]
+            end;
+            evals_count=4,
+            labeling_scheme=:BE,
+            labeling_subsys_priority=[2, 1],
+            labeling_BEs_count=3)
+        @test sweep_be.labeling_scheme == :BE
+        @test sweep_be.labeling_subsys_priority == [2, 1]
+        @test sweep_be.labeling_BEs_count == 3
+        @test sweep_be.dressed_indices !== nothing
+        @test sweep_be.lookups !== nothing
+        @test length(sweep_be.lookups[1].bare_to_dressed) == 3
+    end
+
+    @testset "ParameterSweep lookup API parity" begin
+        osc1 = Oscillator(E_osc=5.0, truncated_dim=3)
+        osc2 = Oscillator(E_osc=6.0, truncated_dim=3)
+        hs = HilbertSpace([osc1, osc2])
+        add_interaction!(hs, 0.05, [osc1, osc2],
+            [s -> annihilation_operator(s) + creation_operator(s),
+             s -> annihilation_operator(s) + creation_operator(s)])
+
+        sweep_auto = ParameterSweep(hs,
+            Dict(:ω1 => [5.0, 5.3], :ω2 => [6.0, 6.2]),
+            (hs, vals) -> begin
+                hs.subsystems[1].E_osc = vals[:ω1]
+                hs.subsystems[2].E_osc = vals[:ω2]
+            end;
+            evals_count=6,
+            store_lookups=true)
+
+        hs_post = HilbertSpace([Oscillator(E_osc=5.0, truncated_dim=3),
+                                Oscillator(E_osc=6.0, truncated_dim=3)])
+        add_interaction!(hs_post, 0.05, [hs_post.subsystems[1], hs_post.subsystems[2]],
+            [s -> annihilation_operator(s) + creation_operator(s),
+             s -> annihilation_operator(s) + creation_operator(s)])
+        sweep_post = ParameterSweep(hs_post,
+            Dict(:ω1 => [5.0, 5.3], :ω2 => [6.0, 6.2]),
+            (hs, vals) -> begin
+                hs.subsystems[1].E_osc = vals[:ω1]
+                hs.subsystems[2].E_osc = vals[:ω2]
+            end;
+            evals_count=6,
+            store_lookups=false)
+
+        @test !lookup_exists(sweep_post)
+        post_lookups = generate_lookup!(sweep_post)
+        @test lookup_exists(sweep_auto)
+        @test lookup_exists(sweep_post)
+        @test post_lookups === sweep_post.lookups
+        @test length(sweep_auto.lookups) == length(sweep_post.lookups)
+
+        for point in 1:length(sweep_auto.lookups)
+            @test sweep_post.lookups[point].bare_to_dressed == sweep_auto.lookups[point].bare_to_dressed
+            @test sweep_post.lookups[point].dressed_to_bare == sweep_auto.lookups[point].dressed_to_bare
+            @test sweep_post.lookups[point].dressed_evals == sweep_auto.lookups[point].dressed_evals
+            @test sweep_post.dressed_indices[point] == sweep_auto.dressed_indices[point]
+        end
+
+        idx_12 = dressed_index(sweep_auto, 1, 2; param_indices=(1, 1))
+        @test idx_12 == get(sweep_auto.lookups[1].bare_to_dressed, (1, 2), nothing)
+        @test bare_index(sweep_auto, idx_12; param_indices=(1, 1)) ==
+              sweep_auto.lookups[1].dressed_to_bare[idx_12]
+        @test energy_by_bare_index(sweep_auto, 1, 2; param_indices=(1, 1)) ==
+              ScQubitsMimic._lookup_energy_by_bare_index(sweep_auto.lookups[1], (1, 2))
+        @test energy_by_bare_index(sweep_auto, 1, 2; param_indices=(1, 1), subtract_ground=true) ==
+              ScQubitsMimic._lookup_energy_by_bare_index(sweep_auto.lookups[1], (1, 2); subtract_ground=true)
+        @test energy_by_dressed_index(sweep_auto, idx_12; param_indices=(1, 1)) ==
+              sweep_auto.dressed_evals[1, idx_12]
+        @test energy_by_dressed_index(sweep_auto, idx_12; param_indices=(1, 1), subtract_ground=true) ==
+              sweep_auto.dressed_evals[1, idx_12] - sweep_auto.dressed_evals[1, 1]
+
+        idx_point_21 = ScQubitsMimic._parameter_point_index(sweep_auto, (2, 1))
+        @test idx_point_21 == 2
+        @test energy_by_dressed_index(sweep_auto, 1; param_indices=(2, 1)) ==
+              sweep_auto.dressed_evals[idx_point_21, 1]
+        @test isnan(energy_by_bare_index(sweep_auto, 9, 9; param_indices=(1, 1)))
+
+        sweep_no_run = ParameterSweep(HilbertSpace([Oscillator(E_osc=5.0, truncated_dim=2),
+                                                    Oscillator(E_osc=6.0, truncated_dim=2)]),
+            Dict(:ω2 => [6.0]),
+            (hs, vals) -> begin
+                hs.subsystems[2].E_osc = vals[:ω2]
+            end;
+            evals_count=4,
+            autorun=false,
+            store_lookups=false)
+        @test_throws ArgumentError generate_lookup!(sweep_no_run)
+        @test_throws ErrorException dressed_index(sweep_no_run, 1, 1; param_indices=(1,))
+        @test_throws BoundsError energy_by_dressed_index(sweep_auto, 1; param_indices=(3, 1))
+        @test_throws ArgumentError energy_by_dressed_index(sweep_auto, 1; param_indices=(1,))
+
+        sweep_bare_only = ParameterSweep(HilbertSpace([Oscillator(E_osc=5.0, truncated_dim=2),
+                                                       Oscillator(E_osc=6.0, truncated_dim=2)]),
+            Dict(:ω2 => [6.0]),
+            (hs, vals) -> begin
+                hs.subsystems[2].E_osc = vals[:ω2]
+            end;
+            evals_count=4,
+            bare_only=true)
+        @test_throws ArgumentError generate_lookup!(sweep_bare_only)
+    end
+
+    @testset "SweepSlice and transition API parity" begin
+        osc1 = Oscillator(E_osc=5.9, truncated_dim=3)
+        osc2 = Oscillator(E_osc=5.7, truncated_dim=3)
+        hs1d = HilbertSpace([osc1, osc2])
+        add_interaction!(hs1d, 0.08, [osc1, osc2],
+            [s -> annihilation_operator(s) + creation_operator(s),
+             s -> annihilation_operator(s) + creation_operator(s)])
+
+        sweep1d = ParameterSweep(hs1d,
+            Dict(:ω2 => [5.6, 5.9, 6.2]),
+            (hs, vals) -> begin
+                hs.subsystems[2].E_osc = vals[:ω2]
+            end;
+            evals_count=6,
+            store_lookups=true,
+            ignore_low_overlap=true)
+
+        slice1d = sweep1d[:]
+        @test slice1d isa SweepSlice
+        @test slice1d.param_name == :ω2
+        @test slice1d.param_vals == [5.6, 5.9, 6.2]
+        @test slice1d.point_param_indices == [(1,), (2,), (3,)]
+
+        point_slice = sweep1d[2]
+        @test point_slice isa SweepSlice
+        @test isempty(point_slice.free_dims)
+        @test_throws ArgumentError transitions(point_slice)
+
+        bare_components = dressed_state_components(sweep1d, (2, 1); param_indices=(2,))
+        slice_components = dressed_state_components(point_slice, (2, 1))
+        @test bare_components == slice_components
+        @test first(bare_components).first == (2, 1)
+        @test first(bare_components).second > 0.45
+
+        dressed_components = dressed_state_components(sweep1d, 2; param_indices=(2,), return_probability=false)
+        @test !isempty(dressed_components)
+        @test dressed_components[1].second isa ComplexF64
+
+        transitions_list, transition_energies = transitions(slice1d; final=(2, 1))
+        @test transitions_list == [((1, 1), (2, 1))]
+        @test length(transition_energies) == 1
+        @test transition_energies[1] ≈ [
+            energy_by_bare_index(sweep1d, 2, 1; param_indices=(i,), subtract_ground=true)
+            for i in 1:3
+        ]
+
+        idx_21 = dressed_index(sweep1d, 2, 1; param_indices=(2,))
+        dressed_transition_labels, dressed_transition_energies =
+            transitions(slice1d; initial=idx_21, final=1, make_positive=true)
+        @test dressed_transition_labels == [(idx_21, 1)]
+        @test length(dressed_transition_energies) == 1
+
+        default_transitions, _ = transitions(slice1d)
+        sideband_transitions, _ = transitions(slice1d; sidebands=true)
+        @test length(sideband_transitions) > length(default_transitions)
+
+        all_dressed_transitions, _ = transitions(slice1d; final=-1)
+        @test length(all_dressed_transitions) == sweep1d.evals_count
+
+        spec = transitions(slice1d; as_specdata=true, final=[(2, 1), (1, 2)])
+        @test spec.param_name == :ω2
+        @test spec.param_vals == [5.6, 5.9, 6.2]
+        @test size(spec.energy_table) == (3, 2)
+        @test length(spec.labels) == 2
+
+        fig_plain = plot_transitions(slice1d; coloring="plain")
+        fig_highlight = plot_transitions(slice1d; final=[(2, 1), (1, 2)])
+        @test fig_plain isa Figure
+        @test fig_highlight isa Figure
+
+        hs2d = HilbertSpace([Oscillator(E_osc=5.0, truncated_dim=3),
+                             Oscillator(E_osc=6.0, truncated_dim=3)])
+        add_interaction!(hs2d, 0.05, [hs2d.subsystems[1], hs2d.subsystems[2]],
+            [s -> annihilation_operator(s) + creation_operator(s),
+             s -> annihilation_operator(s) + creation_operator(s)])
+        sweep2d = ParameterSweep(hs2d,
+            Dict(:ω1 => [5.0, 5.2], :ω2 => [6.0, 6.2]),
+            (hs, vals) -> begin
+                hs.subsystems[1].E_osc = vals[:ω1]
+                hs.subsystems[2].E_osc = vals[:ω2]
+            end;
+            evals_count=6,
+            store_lookups=true)
+
+        slice_row = sweep2d[1, :]
+        @test slice_row.param_name == :ω2
+        @test slice_row.point_param_indices == [(1, 1), (1, 2)]
+        @test_throws ArgumentError sweep2d[1]
+        @test_throws ArgumentError plot_transitions(sweep2d)
+        @test_throws ArgumentError plot_transitions(sweep2d[:, :])
     end
 
     @testset "Dispersive shifts (chi/Kerr)" begin
@@ -513,10 +931,10 @@ branches:
         add_interaction!(hs, 0.1, [tmon, osc],
             [s -> cos_phi_operator(s), s -> annihilation_operator(s) + creation_operator(s)])
 
-        sweep = HilbertSpaceSweep(hs,
+        sweep = ParameterSweep(hs,
             Dict(:flux => [0.0, 0.125, 0.25]),
-            (hs, vals) -> begin tmon.flux = vals[:flux] end;
-            evals_count=10, store_lookups=true)
+            (hs, vals) -> begin hs.subsystems[1].flux = vals[:flux] end;
+            evals_count=10)
 
         chi_arr = chi_matrix(sweep)
         @test size(chi_arr) == (3, 2, 2)
@@ -908,8 +1326,8 @@ branches:
   - [C, 0, 1, EC=0.5]
 """
         circ = Circuit(desc; ncut=10)
-        # sym_hamiltonian returns a symbolic expression (not nothing)
-        @test sym_hamiltonian(circ) !== nothing
+        # sym_hamiltonian can still return a symbolic expression via return_expr=true
+        @test sym_hamiltonian(circ; return_expr=true) !== nothing
         @test sym_hamiltonian_node(circ) !== nothing
         T, vc = variable_transformation(circ)
         @test size(T) == (1, 1)
@@ -1230,12 +1648,12 @@ branches:
         configure!(circ; system_hierarchy=[[1],[2]], subsystem_trunc_dims=[10, 10])
 
         # Full Hamiltonian still works
-        H_full = sym_hamiltonian(circ)
+        H_full = sym_hamiltonian(circ; return_expr=true)
         @test H_full isa Sym.Num
 
         # Subsystem Hamiltonians
-        H1 = sym_hamiltonian(circ; subsystem_index=1)
-        H2 = sym_hamiltonian(circ; subsystem_index=2)
+        H1 = sym_hamiltonian(circ; subsystem_index=1, return_expr=true)
+        H2 = sym_hamiltonian(circ; subsystem_index=2, return_expr=true)
         @test H1 isa Sym.Num
         @test H2 isa Sym.Num
 
@@ -1254,6 +1672,16 @@ branches:
 
         # Invalid subsystem_index
         @test_throws ErrorException sym_hamiltonian(circ; subsystem_index=3)
+
+        H_fmt = sym_hamiltonian(circ; subsystem_index=1, float_round=2, return_expr=true)
+        H_expected = ScQubitsMimic._format_symbolic_expr(
+            circ,
+            ScQubitsMimic._raw_sym_hamiltonian_expr(circ; subsystem_index=1);
+            float_round=2,
+        )
+        @test isequal(H_fmt, H_expected)
+        @test sym_hamiltonian(circ; subsystem_index=1, return_expr=false) === nothing
+        @test sym_hamiltonian(circ; subsystem_index=1, return_expr=false, print_latex=true) === nothing
     end
 
     @testset "sym_interaction returns nontrivial coupling" begin
@@ -1303,9 +1731,9 @@ branches:
         circ = Circuit(desc; ncut=10)
         configure!(circ; system_hierarchy=[[1],[2]], subsystem_trunc_dims=[10, 10])
 
-        H_full = sym_hamiltonian(circ)
-        H1 = sym_hamiltonian(circ; subsystem_index=1)
-        H2 = sym_hamiltonian(circ; subsystem_index=2)
+        H_full = ScQubitsMimic._raw_sym_hamiltonian_expr(circ)
+        H1 = ScQubitsMimic._raw_sym_hamiltonian_expr(circ; subsystem_index=1)
+        H2 = ScQubitsMimic._raw_sym_hamiltonian_expr(circ; subsystem_index=2)
         H_int = ScQubitsMimic._raw_subsystem_interaction_expr(circ, (1, 2))
 
         # H1 + H2 + H_int should equal H_full (symbolic difference simplifies to 0)
@@ -1345,7 +1773,7 @@ branches:
 
         # Each subsystem has its own symbolic Hamiltonian
         for i in 1:3
-            Hi = sym_hamiltonian(circ; subsystem_index=i)
+            Hi = sym_hamiltonian(circ; subsystem_index=i, return_expr=true)
             @test Hi isa ScQubitsMimic.Symbolics.Num
         end
 
@@ -1415,8 +1843,177 @@ branches:
         set_param!(circ, :EJ, 12.0)
         @test circ._hilbert_space === nothing
         @test circ._subsystems === nothing
+        @test circ._hd_cache === nothing
         @test circ._subsystem_sym_hamiltonians !== nothing  # symbolic still valid
         @test circ._hierarchical_diagonalization == true     # flag still set
+    end
+
+    @testset "configure! reuses HD cache for flux updates" begin
+        desc = """
+branches:
+  - [JJ, 0, 1, EJ=4.5, EC=0.1]
+  - [JJ, 1, 0, EJ=10.5, EC=0.1]
+  - [C, 1, 0, EC=0.2]
+  - [C, 1, 2, EC=5.0]
+  - [JJ, 0, 2, EJ=30.0, EC=0.1]
+  - [JJ, 2, 0, EJ=20.0, EC=0.1]
+  - [C, 2, 0, EC=0.1]
+  - [C, 2, 3, EC=5.0]
+  - [JJ, 0, 3, EJ=4.6, EC=0.1]
+  - [JJ, 3, 0, EJ=10.0, EC=0.1]
+  - [C, 3, 0, EC=0.2]
+  - [C, 1, 3, EC=500.0]
+"""
+        hierarchy = [[1], [2], [3]]
+        trunc_dims = [3, 3, 3]
+
+        fresh_hs(phi1, phi2) = begin
+            fresh = Circuit(desc; ncut=6)
+            set_param!(fresh, :Φ1, phi1)
+            set_param!(fresh, :Φ2, phi2)
+            hierarchical_diag(fresh;
+                system_hierarchy=hierarchy,
+                subsystem_trunc_dims=trunc_dims)
+        end
+
+        circ = Circuit(desc; ncut=6)
+        set_param!(circ, :Φ1, 0.0)
+        set_param!(circ, :Φ2, 0.0)
+        configure!(circ;
+            system_hierarchy=hierarchy,
+            subsystem_trunc_dims=trunc_dims)
+
+        cached = circ._hd_cache
+        @test cached !== nothing
+
+        set_param!(circ, :Φ1, π / 7)
+        @test circ._hilbert_space !== nothing
+        @test circ._hd_cache === cached
+        @test eigenvals(circ._hilbert_space; evals_count=8) ≈
+              eigenvals(fresh_hs(π / 7, 0.0); evals_count=8) atol=1e-9
+
+        set_param!(circ, :Φ2, -π / 5)
+        @test circ._hilbert_space !== nothing
+        @test circ._hd_cache === cached
+        @test eigenvals(circ._hilbert_space; evals_count=8) ≈
+              eigenvals(fresh_hs(π / 7, -π / 5); evals_count=8) atol=1e-9
+    end
+
+    @testset "configure! reuses HD cache for nested ng updates" begin
+        desc = """
+branches:
+  - [JJ, 0, 1, EJ=10.0, EC=0.3]
+  - [JJ, 0, 2, EJ=8.0, EC=0.4]
+  - [JJ, 0, 3, EJ=6.0, EC=0.5]
+  - [C, 1, 2, EC=0.08]
+  - [C, 2, 3, EC=0.06]
+"""
+        hierarchy = [[[1], [2]], [3]]
+        trunc_dims = [[11^2, [11, 11]], 11]
+
+        fresh_hs(ng1) = begin
+            fresh = Circuit(desc; ncut=5)
+            set_param!(fresh, :ng1, ng1)
+            hierarchical_diag(fresh;
+                system_hierarchy=hierarchy,
+                subsystem_trunc_dims=trunc_dims)
+        end
+
+        circ = Circuit(desc; ncut=5)
+        configure!(circ;
+            system_hierarchy=hierarchy,
+            subsystem_trunc_dims=trunc_dims)
+
+        cached = circ._hd_cache
+        set_param!(circ, :ng1, 0.2)
+
+        @test circ._hilbert_space !== nothing
+        @test circ._hd_cache === cached
+        @test eigenvals(circ._hilbert_space; evals_count=6) ≈
+              eigenvals(fresh_hs(0.2); evals_count=6) atol=1e-9
+    end
+
+    @testset "Configured HD sweep matches rebuild sweep" begin
+        ELEMENTARY_CHARGE_TEST = 1.602176634e-19
+        PLANCK_CONSTANT_TEST = 6.62607015e-34
+        physical_ec_from_capacitance_ff(C_ff) =
+            ELEMENTARY_CHARGE_TEST^2 / (2 * C_ff * 1e-15 * PLANCK_CONSTANT_TEST) / 1e9
+        branch_ec_from_capacitance_ff(C_ff) = physical_ec_from_capacitance_ff(C_ff) / 4
+
+        desc = """
+branches:
+  - [JJ, 0, 1, EJ=12.2, EC=1.0e6]
+  - [C, 1, 0, EC=$(branch_ec_from_capacitance_ff(95.0))]
+  - [JJ, 0, 2, EJ=46.0, EC=1.0e6]
+  - [JJ, 2, 0, EJ=25.0, EC=1.0e6]
+  - [C, 2, 0, EC=$(branch_ec_from_capacitance_ff(228.0))]
+  - [JJ, 0, 3, EJ=13.0, EC=1.0e6]
+  - [JJ, 3, 0, EJ=2.8, EC=1.0e6]
+  - [C, 3, 0, EC=$(branch_ec_from_capacitance_ff(98.0))]
+  - [C, 1, 2, EC=$(branch_ec_from_capacitance_ff(5.36))]
+  - [C, 2, 3, EC=$(branch_ec_from_capacitance_ff(5.36))]
+  - [C, 1, 3, EC=$(branch_ec_from_capacitance_ff(0.125))]
+"""
+        flux_bias_to_rad(bias) = 2π * bias
+        hierarchy = [[1], [2], [3]]
+        trunc_dims = [3, 3, 3]
+        phi_vals = collect(range(-0.5, 0.0; length=5))
+
+        build_sung_circuit_test(; flux_cplr=0.0, flux_qb2=0.0, ncut=6) = begin
+            circ = Circuit(desc; ncut=ncut)
+            set_param!(circ, :Φ1, flux_bias_to_rad(flux_cplr))
+            set_param!(circ, :Φ2, flux_bias_to_rad(flux_qb2))
+            circ
+        end
+
+        build_hs_rebuild(; flux_cplr=0.0, flux_qb2=0.0, ncut=6) =
+            hierarchical_diag(build_sung_circuit_test(; flux_cplr=flux_cplr, flux_qb2=flux_qb2, ncut=ncut);
+                system_hierarchy=hierarchy,
+                subsystem_trunc_dims=trunc_dims)
+
+        build_configured_circuit(; flux_cplr=0.0, flux_qb2=0.0, ncut=6) = begin
+            circ = build_sung_circuit_test(; flux_cplr=flux_cplr, flux_qb2=flux_qb2, ncut=ncut)
+            configure!(circ;
+                system_hierarchy=hierarchy,
+                subsystem_trunc_dims=trunc_dims)
+            circ
+        end
+
+        sweep_rebuild = ParameterSweep(
+            build_hs_rebuild(; flux_cplr=first(phi_vals), flux_qb2=first(phi_vals)),
+            Dict(:Φ1 => phi_vals, :Φ2 => phi_vals),
+            (sweep, flux_cplr, flux_qb2) -> begin
+                sweep.hilbertspace = build_hs_rebuild(; flux_cplr=flux_cplr, flux_qb2=flux_qb2)
+            end;
+            evals_count=prod(trunc_dims),
+            subsys_update_info=Dict(:Φ1 => [2], :Φ2 => [3]),
+            ignore_low_overlap=true,
+            store_lookups=true)
+
+        circ_reuse = build_configured_circuit(; flux_cplr=first(phi_vals), flux_qb2=first(phi_vals))
+        sweep_reuse = ParameterSweep(
+            circ_reuse._hilbert_space,
+            Dict(:Φ1 => phi_vals, :Φ2 => phi_vals),
+            (sweep, flux_cplr, flux_qb2) -> begin
+                set_param!(circ_reuse, :Φ1, flux_bias_to_rad(flux_cplr))
+                set_param!(circ_reuse, :Φ2, flux_bias_to_rad(flux_qb2))
+                sweep.hilbertspace = circ_reuse._hilbert_space
+            end;
+            evals_count=prod(trunc_dims),
+            subsys_update_info=Dict(:Φ1 => [2], :Φ2 => [3]),
+            ignore_low_overlap=true,
+            store_lookups=true)
+
+        @test sweep_reuse.dressed_evals ≈ sweep_rebuild.dressed_evals atol=1e-9
+        @test chi_matrix(sweep_reuse) ≈ chi_matrix(sweep_rebuild) atol=1e-9
+
+        sample_points = [1, length(sweep_reuse.lookups) ÷ 2 + 1, length(sweep_reuse.lookups)]
+        for idx in sample_points
+            @test sweep_reuse.lookups[idx].dressed_evals ≈
+                  sweep_rebuild.lookups[idx].dressed_evals atol=1e-9
+            @test sweep_reuse.dressed_indices[idx] == sweep_rebuild.dressed_indices[idx]
+            @test sweep_reuse.bare_evals[idx] == sweep_rebuild.bare_evals[idx]
+        end
     end
 
     @testset "Multi-mode subsystem grouping" begin
@@ -1435,8 +2032,8 @@ branches:
         configure!(circ; system_hierarchy=[[1,2],[3]],
                   subsystem_trunc_dims=[20, 10])
 
-        H1 = sym_hamiltonian(circ; subsystem_index=1)
-        H2 = sym_hamiltonian(circ; subsystem_index=2)
+        H1 = sym_hamiltonian(circ; subsystem_index=1, return_expr=true)
+        H2 = sym_hamiltonian(circ; subsystem_index=2, return_expr=true)
 
         # H1 should contain modes 1 and/or 2 but not mode 3
         h1_vars = Sym.get_variables(H1)

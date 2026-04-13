@@ -1,0 +1,8 @@
+[deps]
+CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+ScQubitsMimic = "91c70506-153b-4bc2-8e1e-bd0fd87a11fa"
+
+[compat]
+CairoMakie = "0.15"
+Documenter = "1"

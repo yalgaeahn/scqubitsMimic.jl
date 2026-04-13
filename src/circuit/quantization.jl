@@ -58,6 +58,7 @@ mutable struct Circuit <: AbstractQuantumSystem
     _subsystem_trunc_dims::Any                          # nothing or scqubits-style truncation list
     _subsystems::Union{Nothing, Vector}                 # Vector{SubCircuit} when set
     _hilbert_space::Any                                 # HilbertSpace when set
+    _hd_cache::Any                                      # internal HD cache tree when set
     _subsystem_sym_hamiltonians::Union{Nothing, Dict{Int, Num}}
     _subsystem_interactions_sym::Union{Nothing, Dict{Set{Int}, Num}}
     _hierarchical_diagonalization::Bool
@@ -109,7 +110,7 @@ function Circuit(description::String;
                    ext_vals, ng_vals,
                    Dict{Tuple{Int, Symbol}, Float64}(), nothing,
                    # Hierarchical diagonalization config (initially unconfigured)
-                   nothing, nothing, nothing, nothing, nothing, nothing, false)
+                   nothing, nothing, nothing, nothing, nothing, nothing, nothing, false)
 
     # Compute oscillator lengths (needs the Circuit to read branch params)
     circ.osc_lengths = _compute_osc_lengths(circ)
@@ -141,18 +142,43 @@ function hamiltonian(circ::Circuit)
     return H
 end
 
-"""Invalidate cached Hamiltonian (call after changing parameters)."""
-function invalidate_cache!(circ::Circuit)
+function _invalidate_hamiltonian_cache!(circ::Circuit)
     circ._hamiltonian_cache = nothing
     # Recompute oscillator lengths if branch parameters have been overridden
     if !isempty(circ.branch_param_overrides)
         circ.osc_lengths = _compute_osc_lengths(circ)
     end
+    return circ
+end
+
+function _clear_hierarchical_cache!(circ::Circuit)
     # Clear numerical HD results (symbolic decomposition stays valid)
     if circ._hierarchical_diagonalization
         circ._hilbert_space = nothing
         circ._subsystems = nothing
+        circ._hd_cache = nothing
     end
+    return circ
+end
+
+function _refresh_configured_hierarchy_after_param!(circ::Circuit, param_name::Symbol)
+    _invalidate_hamiltonian_cache!(circ)
+    if circ._hierarchical_diagonalization
+        if circ._hd_cache !== nothing
+            _refresh_configured_hierarchical!(circ, param_name)
+        else
+            circ._hilbert_space = nothing
+            circ._subsystems = nothing
+        end
+    end
+    return circ
+end
+
+"""Invalidate cached Hamiltonian (call after changing parameters)."""
+function invalidate_cache!(circ::Circuit)
+    _invalidate_hamiltonian_cache!(circ)
+    _clear_hierarchical_cache!(circ)
+    return circ
 end
 
 # ── Hierarchical diagonalization configuration ─────────────────────────────
@@ -383,8 +409,8 @@ function configure!(circ::Circuit; system_hierarchy, subsystem_trunc_dims=nothin
     circ._subsystem_sym_hamiltonians = subsys_H
     circ._subsystem_interactions_sym = interactions
 
-    # Numerical hierarchical diagonalization (reuse existing function)
-    hs = hierarchical_diag(circ;
+    # Numerical hierarchical diagonalization with reusable cache
+    hs = _configure_hierarchical_cache!(circ;
         system_hierarchy=system_hierarchy,
         subsystem_trunc_dims=subsystem_trunc_dims)
     circ._hilbert_space = hs
@@ -396,15 +422,15 @@ end
 # ── Symbolic accessors ──────────────────────────────────────────────────────
 
 """
-    sym_hamiltonian(circ::Circuit; subsystem_index=nothing)
+    _raw_sym_hamiltonian_expr(circ::Circuit; subsystem_index=nothing)
 
-Return the symbolic Hamiltonian expression (in mode variables).
+Return the unformatted symbolic Hamiltonian expression (in mode variables).
 
 Without `subsystem_index`: returns the full-circuit symbolic Hamiltonian.
 With `subsystem_index=i` (1-based): returns the symbolic Hamiltonian for
 subsystem `i` only, as decomposed by [`configure!`](@ref).
 """
-function sym_hamiltonian(circ::Circuit; subsystem_index::Union{Nothing,Int}=nothing)
+function _raw_sym_hamiltonian_expr(circ::Circuit; subsystem_index::Union{Nothing,Int}=nothing)
     if subsystem_index === nothing
         return circ.mode_hamiltonian_symbolic
     end
@@ -416,6 +442,37 @@ function sym_hamiltonian(circ::Circuit; subsystem_index::Union{Nothing,Int}=noth
         error("subsystem_index=$subsystem_index is out of range. " *
               "Valid indices: $(sort(collect(keys(circ._subsystem_sym_hamiltonians))))")
     return circ._subsystem_sym_hamiltonians[subsystem_index]
+end
+
+"""
+    sym_hamiltonian(circ::Circuit;
+                    subsystem_index=nothing,
+                    float_round=6,
+                    print_latex=false,
+                    return_expr=false)
+
+Return or print the formatted symbolic Hamiltonian expression.
+
+Julia uses 1-based subsystem indices. With `return_expr=true`, printing is
+suppressed and the formatted `Symbolics.Num` is returned.
+"""
+function sym_hamiltonian(circ::Circuit;
+                         subsystem_index::Union{Nothing,Int}=nothing,
+                         float_round::Int=6,
+                         print_latex::Bool=false,
+                         return_expr::Bool=false)
+    expr = _raw_sym_hamiltonian_expr(circ; subsystem_index=subsystem_index)
+    display_expr = _format_symbolic_expr(circ, expr; float_round=float_round)
+
+    if return_expr
+        return display_expr
+    end
+
+    if print_latex
+        println(latexify(display_expr))
+    end
+    println(display_expr)
+    return nothing
 end
 
 """Return the symbolic Hamiltonian expression (in node variables)."""
@@ -479,6 +536,10 @@ function _raw_subsystem_interaction_expr(circ::Circuit,
 end
 
 function _format_interaction_expr(circ::Circuit, expr::Num; float_round::Int=6)
+    return _format_symbolic_expr(circ, expr; float_round=float_round)
+end
+
+function _format_symbolic_expr(circ::Circuit, expr::Num; float_round::Int=6)
     display_expr = _round_symbolic_floats(expr, float_round)
     return _humanize_external_fluxes(circ, display_expr)
 end
@@ -741,16 +802,22 @@ end
 
 """Set external flux value. `index` is 1-based."""
 function set_external_flux!(circ::Circuit, index::Int, value::Float64)
+    old = circ.external_flux_values[index]
+    isequal(old, value) && return circ
     circ.external_flux_values[index] = value
-    invalidate_cache!(circ)
+    _refresh_configured_hierarchy_after_param!(circ, Symbol("Φ$(index)"))
+    return circ
 end
 
 """Set offset charge value for periodic mode `index`."""
 function set_offset_charge!(circ::Circuit, index::Int, value::Float64)
     index in circ.var_categories.periodic ||
         throw(ArgumentError("Offset charge ng$index is only defined for periodic modes $(circ.var_categories.periodic)"))
+    old = get(circ.offset_charge_values, index, 0.0)
+    isequal(old, value) && return circ
     circ.offset_charge_values[index] = value
-    invalidate_cache!(circ)
+    _refresh_configured_hierarchy_after_param!(circ, Symbol("ng$(index)"))
+    return circ
 end
 
 # ── set_param! / get_param for parameter sweeps ─────────────────────────────

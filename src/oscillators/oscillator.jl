@@ -31,6 +31,11 @@ function eigensys(o::Oscillator; evals_count::Int=o.truncated_dim)
     return vals, vecs
 end
 
+"""Return the annihilation operator `â` for an [`Oscillator`](@ref)."""
 annihilation_operator(o::Oscillator) = destroy(o.truncated_dim)
+
+"""Return the creation operator `â†` for an [`Oscillator`](@ref)."""
 creation_operator(o::Oscillator) = create(o.truncated_dim)
+
+"""Return the number operator `â†â` for an [`Oscillator`](@ref)."""
 number_operator(o::Oscillator) = num(o.truncated_dim)
