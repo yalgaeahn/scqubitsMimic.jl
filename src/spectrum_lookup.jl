@@ -63,22 +63,21 @@ function _lookup_build_data_from_spectral_data(hs::HilbertSpace,
     end
 
     bare_indices = _generate_bare_indices(sub_dims)
-    overlap = zeros(Float64, n_dressed, length(bare_indices))
-
-    for (j, bare_idx) in enumerate(bare_indices)
-        bare_state = bare_evecs_ref[1][:, bare_idx[1]]
-        for k in 2:n_sub
-            bare_state = kron(bare_state, bare_evecs_ref[k][:, bare_idx[k]])
-        end
-
-        for i in 1:n_dressed
-            overlap[i, j] = abs2(dot(dressed_vecs_ref[:, i], bare_state))
-        end
-    end
+    bare_basis = _bare_product_basis_matrix(bare_evecs_ref)
+    overlap = abs2.(dressed_vecs_ref' * bare_basis)
 
     return (; dressed_vals=dressed_vals_ref, dressed_vecs=dressed_vecs_ref,
             bare_evals=bare_evals_ref, bare_evecs=bare_evecs_ref,
             sub_dims, bare_indices, overlap)
+end
+
+function _bare_product_basis_matrix(bare_evecs::Vector{Matrix{ComplexF64}})
+    isempty(bare_evecs) && return Matrix{ComplexF64}(I, 1, 1)
+    basis = bare_evecs[1]
+    for k in 2:length(bare_evecs)
+        basis = kron(basis, bare_evecs[k])
+    end
+    return basis
 end
 
 function _lookup_build_data(hs::HilbertSpace; evals_count::Int=10)
