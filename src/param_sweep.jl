@@ -65,16 +65,32 @@ mutable struct ParameterSweep
     store_lookups::Bool
 end
 
-function _normalize_paramvals_by_name(paramvals_by_name::AbstractDict)
+function _normalize_param_pair_entries(entries)
     param_order = Symbol[]
     param_vals = Dict{Symbol, Vector{Float64}}()
-    for (name, vals) in pairs(paramvals_by_name)
+    for pair in entries
+        name, vals = pair
         sym_name = Symbol(name)
+        sym_name in param_order && throw(ArgumentError(
+            "Duplicate sweep parameter name: $sym_name"))
         push!(param_order, sym_name)
         param_vals[sym_name] = collect(Float64, vals)
     end
     isempty(param_order) && throw(ArgumentError("paramvals_by_name must not be empty"))
     return param_order, param_vals
+end
+
+function _normalize_paramvals_by_name(paramvals_by_name::AbstractDict)
+    sorted_names = sort(collect(keys(paramvals_by_name)); by=name -> string(Symbol(name)))
+    return _normalize_param_pair_entries(name => paramvals_by_name[name] for name in sorted_names)
+end
+
+function _normalize_paramvals_by_name(paramvals_by_name::AbstractVector{<:Pair})
+    return _normalize_param_pair_entries(paramvals_by_name)
+end
+
+function _normalize_paramvals_by_name(paramvals_by_name::Tuple{Vararg{Pair}})
+    return _normalize_param_pair_entries(paramvals_by_name)
 end
 
 function _normalize_subsys_update_info(hs::HilbertSpace, subsys_update_info)
@@ -300,7 +316,7 @@ provides naming and core analysis-flow parity, but not the full scqubits
 preslicing or dict-like data-container interface.
 """
 function ParameterSweep(hilbertspace::HilbertSpace,
-                        paramvals_by_name::AbstractDict,
+                        paramvals_by_name,
                         update_hilbertspace::Function;
                         evals_count::Int=20,
                         subsys_update_info=nothing,

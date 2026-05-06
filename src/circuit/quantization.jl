@@ -20,7 +20,7 @@ branches:
 
 # Fields
 - `symbolic_circuit` — symbolic analysis results
-- `transformation_matrix` — T: node → mode variables
+- `transformation_matrix` — T: mode → node variables, `φ = Tθ`
 - `var_categories` — mode classification (periodic/extended/free/frozen)
 - `cutoffs` — Hilbert space truncation per mode
 - `ext_basis` — basis type for extended variables (:harmonic or :grid)
@@ -98,9 +98,8 @@ function Circuit(description::String;
         phi_ranges[i] = phi_range
     end
 
-    # External fluxes: default to 0
-    n_ext = length(sc.external_fluxes)
-    ext_vals = length(external_fluxes) == n_ext ? external_fluxes : zeros(n_ext)
+    # External fluxes: default to 0 only when omitted
+    ext_vals = _build_external_flux_values(sc, external_fluxes)
 
     # Offset charges: keyed by actual periodic mode index
     ng_vals = _build_offset_charge_values(vc, offset_charges)
@@ -125,6 +124,15 @@ function _build_offset_charge_values(vc::VarCategories, offset_charges::Vector{F
         "Expected $(length(periodic_modes)) offset charges in periodic-mode order $(periodic_modes), got $(length(offset_charges))"
     ))
     return Dict(mode => Float64(offset_charges[idx]) for (idx, mode) in enumerate(periodic_modes))
+end
+
+function _build_external_flux_values(sc::SymbolicCircuit, external_fluxes::Vector{Float64})
+    n_ext = length(sc.external_fluxes)
+    isempty(external_fluxes) && return zeros(Float64, n_ext)
+    length(external_fluxes) == n_ext || throw(ArgumentError(
+        "Expected $n_ext external flux values in external-flux order $(string.(sc.external_fluxes)), got $(length(external_fluxes))"
+    ))
+    return copy(external_fluxes)
 end
 
 # ── AbstractQuantumSystem interface ──────────────────────────────────────────
@@ -636,7 +644,6 @@ function offset_charge_transformation(circ::Circuit)
         push!(eqs, lhs ~ rhs)
     end
 
-    display(eqs)
     return eqs
 end
 
@@ -757,15 +764,13 @@ end
 
 function _sym_lagrangian_new(sc::SymbolicCircuit, cg::CircuitGraph, n::Int,
                               T::Matrix{Float64})
-    T_inv = inv(T)
-
     # Mode variables
     θ_vars = [Symbolics.variable(:θ, i) for i in 1:n]
     θ̇_vars = [Symbolics.variable(:θ̇, i) for i in 1:n]
 
-    # Kinetic energy: T = (1/2) θ̇ᵀ Cθ θ̇  where Cθ = T⁻ᵀ C T⁻¹
+    # Kinetic energy for φ = Tθ: T = (1/2) θ̇ᵀ Cθ θ̇, Cθ = Tᵀ C T
     C_float = Float64.(Symbolics.value.(sc.capacitance_matrix))
-    C_transformed = T_inv' * C_float * T_inv
+    C_transformed = T' * C_float * T
 
     kinetic = Num(0)
     for i in 1:n, j in 1:n
@@ -774,8 +779,8 @@ function _sym_lagrangian_new(sc::SymbolicCircuit, cg::CircuitGraph, n::Int,
     end
     kinetic = kinetic / 2
 
-    # Substitution map: φᵢ → Σⱼ T⁻¹[i,j] θⱼ
-    node_subs = Dict(sc.node_vars[i] => sum(T_inv[i, j] * θ_vars[j] for j in 1:n)
+    # Substitution map: φᵢ → Σⱼ T[i,j] θⱼ
+    node_subs = Dict(sc.node_vars[i] => sum(T[i, j] * θ_vars[j] for j in 1:n)
                       for i in 1:n)
 
     # Inductive potential in mode basis
@@ -969,13 +974,13 @@ function _eval_branch_ext_flux(circ::Circuit, bi::Int)
 end
 
 """Coefficient of mode `mode_idx` in a branch's phase (φ_j - φ_i) after transformation."""
-function _branch_mode_coeff(b::Branch, T_inv::Matrix{Float64}, mode_idx::Int)
+function _branch_mode_coeff(b::Branch, mode_transform::Matrix{Float64}, mode_idx::Int)
     w = 0.0
     if b.node_j != 0
-        w += T_inv[b.node_j, mode_idx]
+        w += mode_transform[b.node_j, mode_idx]
     end
     if b.node_i != 0
-        w -= T_inv[b.node_i, mode_idx]
+        w -= mode_transform[b.node_i, mode_idx]
     end
     return w
 end
@@ -1037,7 +1042,7 @@ function _build_numerical_hamiltonian(circ::Circuit)
     # 1. Charging energy: H_charge = Σ 4*EC_θ[i,j] * (n_i - ng_i)(n_j - ng_j)
     C_numeric = _build_capacitance_matrix_numeric(circ)
     ec_float = inv(C_numeric) ./ 2
-    ec_transformed = T_inv' * ec_float * T_inv
+    ec_transformed = T_inv * ec_float * T_inv'
 
     H = spzeros(ComplexF64, total_dim, total_dim)
 
@@ -1046,29 +1051,8 @@ function _build_numerical_hamiltonian(circ::Circuit)
             ec_val = ec_transformed[mi, mj]
             abs(ec_val) < 1e-15 && continue
 
-            ni_op = mode_ops[ai].n_op
-            nj_op = mode_ops[aj].n_op
-
-            # Apply offset charges for periodic variables
-            if mi in vc.periodic
-                ng = get(circ.offset_charge_values, mi, 0.0)
-                if abs(ng) > 1e-15
-                    I_i = _eye_like(ni_op)
-                    ni_op = ni_op - ng * I_i
-                end
-            end
-            if mj in vc.periodic
-                ng = get(circ.offset_charge_values, mj, 0.0)
-                if abs(ng) > 1e-15
-                    I_j = _eye_like(nj_op)
-                    nj_op = nj_op - ng * I_j
-                end
-            end
-
-            # Wrap to full space and add
-            ni_full = _identity_wrap_sparse(ni_op, ai, dims)
-            nj_full = _identity_wrap_sparse(nj_op, aj, dims)
-            H .+= 4 * ec_val * ni_full * nj_full
+            _add_charging_term!(H, 4 * ec_val, circ,
+                                mi, ai, mj, aj, dims, mode_ops)
         end
     end
 
@@ -1099,7 +1083,7 @@ function _build_numerical_hamiltonian(circ::Circuit)
 
         # Linear term: EL * Φext * (φ_j - φ_i) in mode-transformed space
         for (ai, mi) in enumerate(active_modes)
-            w_k = _branch_mode_coeff(b, T_inv, mi)
+            w_k = _branch_mode_coeff(b, T, mi)
             abs(w_k) < 1e-15 && continue
             phi_op = _identity_wrap_sparse(mode_ops[ai].phi_op, ai, dims)
             H .+= el * phi_ext_val * w_k * phi_op
@@ -1116,7 +1100,7 @@ function _build_numerical_hamiltonian(circ::Circuit)
         ej_val = ej_current_vals[jj_idx]
 
         # Extract mode coefficients and constant (ext flux) part from symbolic phase
-        phase_coeffs, ext_phase = _extract_phase_info(circ, phase_sym, T_inv, n, active_modes)
+        phase_coeffs, ext_phase = _extract_phase_info(circ, phase_sym, T, n, active_modes)
 
         cos_op = _build_cos_operator(circ, phase_coeffs, ext_phase,
                                      active_modes, dims, mode_ops)
@@ -1130,10 +1114,48 @@ end
 
 struct ModeOperators
     n_op::SparseMatrixCSC{ComplexF64, Int}
+    n2_op::SparseMatrixCSC{ComplexF64, Int}
     phi_op::SparseMatrixCSC{ComplexF64, Int}
     cos_op::SparseMatrixCSC{ComplexF64, Int}
     sin_op::SparseMatrixCSC{ComplexF64, Int}
     exp_ip_op::SparseMatrixCSC{ComplexF64, Int}   # e^{iθ} or e^{iφ}
+end
+
+function _offset_charge_value(circ::Circuit, mode::Int)
+    mode in circ.var_categories.periodic || return 0.0
+    return get(circ.offset_charge_values, mode, 0.0)
+end
+
+function _shifted_n_operator(circ::Circuit, mop::ModeOperators, mode::Int)
+    ng = _offset_charge_value(circ, mode)
+    abs(ng) > 1e-15 || return mop.n_op
+    return mop.n_op - ng * _eye_like(mop.n_op)
+end
+
+function _charge_square_operator(circ::Circuit, mop::ModeOperators, mode::Int)
+    ng = _offset_charge_value(circ, mode)
+    abs(ng) > 1e-15 || return mop.n2_op
+    return mop.n2_op - 2 * ng * mop.n_op + ng^2 * _eye_like(mop.n_op)
+end
+
+function _add_charging_term!(H::SparseMatrixCSC{ComplexF64, Int},
+                             coefficient::Number,
+                             circ::Circuit,
+                             mode_i::Int, pos_i::Int,
+                             mode_j::Int, pos_j::Int,
+                             dims::Vector{Int},
+                             mode_ops::Vector{ModeOperators})
+    if pos_i == pos_j
+        n2_local = _charge_square_operator(circ, mode_ops[pos_i], mode_i)
+        H .+= coefficient * _identity_wrap_sparse(n2_local, pos_i, dims)
+    else
+        ni_local = _shifted_n_operator(circ, mode_ops[pos_i], mode_i)
+        nj_local = _shifted_n_operator(circ, mode_ops[pos_j], mode_j)
+        ni_full = _identity_wrap_sparse(ni_local, pos_i, dims)
+        nj_full = _identity_wrap_sparse(nj_local, pos_j, dims)
+        H .+= coefficient * ni_full * nj_full
+    end
+    return H
 end
 
 function _build_mode_operators(circ::Circuit, active_modes::Vector{Int},
@@ -1146,12 +1168,13 @@ function _build_mode_operators(circ::Circuit, active_modes::Vector{Int},
         if mode in vc.periodic
             ncut = (dim - 1) ÷ 2
             n_op = sparse(n_operator_periodic(ncut).data)
+            n2_op = sparse(n_op * n_op)
             exp_op = sparse(exp_i_theta_operator(ncut).data)
             cos_op = (exp_op + exp_op') / 2
             sin_op = (exp_op - exp_op') / (2im)
             # φ operator not directly available in charge basis; use exp_i_theta
             phi_op = spzeros(ComplexF64, dim, dim)  # placeholder
-            push!(ops, ModeOperators(n_op, phi_op, cos_op, sin_op, exp_op))
+            push!(ops, ModeOperators(n_op, n2_op, phi_op, cos_op, sin_op, exp_op))
         else
             # Extended mode
             if circ.ext_basis == :harmonic
@@ -1161,23 +1184,26 @@ function _build_mode_operators(circ::Circuit, active_modes::Vector{Int},
                 ad = sparse(a')
                 phi_op = osc_len * (a + ad) / sqrt(2)
                 n_op = 1im * (ad - a) / (sqrt(2) * osc_len)
+                n2_op = sparse(n_op * n_op)
                 # cos/sin via matrix exponential
                 phi_dense = Matrix(phi_op)
                 exp_ip = sparse(exp(1im * phi_dense))
                 cos_op = (exp_ip + exp_ip') / 2
                 sin_op = (exp_ip - exp_ip') / (2im)
-                push!(ops, ModeOperators(n_op, phi_op, cos_op, sin_op, exp_ip))
+                push!(ops, ModeOperators(n_op, n2_op, phi_op, cos_op, sin_op, exp_ip))
             else
                 # Grid basis
                 phi_range = circ.phi_grid_ranges[mode]
                 grid = Grid1d(phi_range[1], phi_range[2], dim)
                 phi_op = sparse(phi_operator_grid(grid).data)
+                d = sparse(d_dphi_operator_grid(grid).data)
                 d2 = sparse(d2_dphi2_operator_grid(grid).data)
-                n_op = -d2  # n² ~ -d²/dφ² (up to constants)
+                n_op = -1im * d
+                n2_op = -d2
                 cos_op = sparse(cos_phi_operator_grid(grid).data)
                 sin_op = sparse(sin_phi_operator_grid(grid).data)
                 exp_ip = cos_op + 1im * sin_op
-                push!(ops, ModeOperators(n_op, phi_op, cos_op, sin_op, exp_ip))
+                push!(ops, ModeOperators(n_op, n2_op, phi_op, cos_op, sin_op, exp_ip))
             end
         end
     end
@@ -1195,7 +1221,7 @@ Returns `(coeffs, const_phase)` where:
 - `const_phase::Float64` is the constant (flux-dependent) part of the phase
 """
 function _extract_phase_info(circ::Circuit, phase_sym::Num,
-                              T_inv::Matrix{Float64}, n::Int,
+                              mode_transform::Matrix{Float64}, n::Int,
                               active_modes::Vector{Int})
     sc = circ.symbolic_circuit
     coeffs = Dict{Int, Float64}()
@@ -1209,7 +1235,7 @@ function _extract_phase_info(circ::Circuit, phase_sym::Num,
                 test_vals[ef] = 0.0
             end
             c_k = Float64(Symbolics.value(Symbolics.substitute(phase_sym, test_vals)))
-            coeff += c_k * T_inv[k, mi]
+            coeff += c_k * mode_transform[k, mi]
         end
         if abs(coeff) > 1e-15
             coeffs[ai] = coeff
@@ -1351,7 +1377,7 @@ function _compute_osc_lengths(circ::Circuit)
     L_inv_float = _build_inv_inductance_matrix_numeric(circ)
     T_inv = inv(T)
 
-    ec_transformed = T_inv' * ec_float * T_inv
+    ec_transformed = T_inv * ec_float * T_inv'
     L_inv_transformed = T' * L_inv_float * T
 
     for i in vc.extended

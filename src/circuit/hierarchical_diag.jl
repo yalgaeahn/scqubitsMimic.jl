@@ -280,7 +280,7 @@ struct HierarchyContext
     mode_ops::Vector{ModeOperators}
     ec_transformed::Matrix{Float64}
     L_inv_transformed::Matrix{Float64}
-    T_inv::Matrix{Float64}
+    mode_transform::Matrix{Float64}
     n_nodes::Int
     var_to_pos::Dict{Int,Int}           # variable index → position in active_modes/dims/mode_ops
 end
@@ -301,7 +301,7 @@ function _build_hierarchy_context(circ::Circuit, hier::HierarchyGroup)
 
     C_numeric = _build_capacitance_matrix_numeric(circ)
     ec_float = inv(C_numeric) ./ 2
-    ec_transformed = T_inv' * ec_float * T_inv
+    ec_transformed = T_inv * ec_float * T_inv'
 
     L_inv_float = _build_inv_inductance_matrix_numeric(circ)
     L_inv_transformed = T' * L_inv_float * T
@@ -311,7 +311,7 @@ function _build_hierarchy_context(circ::Circuit, hier::HierarchyGroup)
     var_to_pos = Dict(mi => ai for (ai, mi) in enumerate(active_modes))
 
     return HierarchyContext(circ, active_modes, dims, mode_ops,
-                            ec_transformed, L_inv_transformed, T_inv, n_nodes,
+                            ec_transformed, L_inv_transformed, T, n_nodes,
                             var_to_pos)
 end
 
@@ -362,7 +362,7 @@ function _build_hd_affected_modes(ctx::HierarchyContext)
 
             branch = sc.graph.branches[bi]
             for mode in ctx.active_modes
-                abs(_branch_mode_coeff(branch, ctx.T_inv, mode)) > 1e-15 || continue
+                abs(_branch_mode_coeff(branch, ctx.mode_transform, mode)) > 1e-15 || continue
                 push!(modes, mode)
             end
         end
@@ -371,7 +371,7 @@ function _build_hd_affected_modes(ctx::HierarchyContext)
             phase_vars = Symbolics.get_variables(phase_sym)
             any(v -> isequal(v, ef), phase_vars) || continue
 
-            coeffs, _ = _extract_phase_info(circ, phase_sym, ctx.T_inv,
+            coeffs, _ = _extract_phase_info(circ, phase_sym, ctx.mode_transform,
                                             ctx.n_nodes, ctx.active_modes)
             for ai in keys(coeffs)
                 push!(modes, ctx.active_modes[ai])
@@ -401,23 +401,16 @@ end
 function _process_leaf(ctx::HierarchyContext, leaf::HierarchyLeaf, trunc_dim::Int)
     circ = ctx.circ
     sc = circ.symbolic_circuit
-    vc = circ.var_categories
     group = leaf.mode_indices           # actual variable indices (scqubits convention)
     sub_dims = [ctx.dims[ctx.var_to_pos[vi]] for vi in group]
+    local_mode_ops = [ctx.mode_ops[ctx.var_to_pos[vi]] for vi in group]
     sub_total = prod(sub_dims)
 
     # ── Build ng-shifted n operators for periodic modes ────────────────────
     shifted_n_ops = Dict{Int, SparseMatrixCSC{ComplexF64, Int}}()
     for vi in group
         pos = ctx.var_to_pos[vi]
-        n_op = ctx.mode_ops[pos].n_op
-        if vi in vc.periodic
-            ng = get(circ.offset_charge_values, vi, 0.0)
-            if abs(ng) > 1e-15
-                n_op = n_op - ng * _eye_like(n_op)
-            end
-        end
-        shifted_n_ops[vi] = n_op
+        shifted_n_ops[vi] = _shifted_n_operator(circ, ctx.mode_ops[pos], vi)
     end
 
     # ── Build sub-Hamiltonian ──────────────────────────────────────────────
@@ -428,9 +421,8 @@ function _process_leaf(ctx::HierarchyContext, leaf::HierarchyLeaf, trunc_dim::In
         for (lj, vj) in enumerate(group)
             ec_val = ctx.ec_transformed[vi, vj]
             abs(ec_val) < 1e-15 && continue
-            ni_full = _identity_wrap_sparse(shifted_n_ops[vi], li, sub_dims)
-            nj_full = _identity_wrap_sparse(shifted_n_ops[vj], lj, sub_dims)
-            H_sub .+= 4 * ec_val * ni_full * nj_full
+            _add_charging_term!(H_sub, 4 * ec_val, circ,
+                                vi, li, vj, lj, sub_dims, local_mode_ops)
         end
     end
 
@@ -453,7 +445,7 @@ function _process_leaf(ctx::HierarchyContext, leaf::HierarchyLeaf, trunc_dim::In
         phi_ext_val = _eval_branch_ext_flux(circ, bi)
         abs(phi_ext_val) < 1e-15 && continue
         for (li, vi) in enumerate(group)
-            w_k = _branch_mode_coeff(b, ctx.T_inv, vi)
+            w_k = _branch_mode_coeff(b, ctx.mode_transform, vi)
             abs(w_k) < 1e-15 && continue
             pos = ctx.var_to_pos[vi]
             phi_op = _identity_wrap_sparse(ctx.mode_ops[pos].phi_op, li, sub_dims)
@@ -465,7 +457,7 @@ function _process_leaf(ctx::HierarchyContext, leaf::HierarchyLeaf, trunc_dim::In
     ej_current_vals = _get_josephson_ej_values(circ)
     for (jj_idx, (ej_sym, phase_sym)) in enumerate(sc.josephson_terms)
         ej_val = ej_current_vals[jj_idx]
-        phase_coeffs, ext_phase = _extract_phase_info(circ, phase_sym, ctx.T_inv,
+        phase_coeffs, ext_phase = _extract_phase_info(circ, phase_sym, ctx.mode_transform,
                                                        ctx.n_nodes, ctx.active_modes)
         # Re-key from active-mode position to variable index
         var_coeffs = Dict(ctx.active_modes[ai] => c for (ai, c) in phase_coeffs)
@@ -476,7 +468,6 @@ function _process_leaf(ctx::HierarchyContext, leaf::HierarchyLeaf, trunc_dim::In
                 li = findfirst(==(vi), group)
                 local_coeffs[li] = c
             end
-            local_mode_ops = [ctx.mode_ops[ctx.var_to_pos[vi]] for vi in group]
             cos_op = _build_cos_operator(circ, local_coeffs, ext_phase,
                                           group, sub_dims, local_mode_ops)
             H_sub .-= ej_val * cos_op
@@ -578,7 +569,7 @@ function _build_intermediate_group_result(ctx::HierarchyContext,
     sc_sym = ctx.circ.symbolic_circuit
     for (jj_idx, (ej_sym, phase_sym)) in enumerate(sc_sym.josephson_terms)
         ej_val = ej_current_vals[jj_idx]
-        phase_coeffs, ext_phase = _extract_phase_info(ctx.circ, phase_sym, ctx.T_inv,
+        phase_coeffs, ext_phase = _extract_phase_info(ctx.circ, phase_sym, ctx.mode_transform,
                                                        ctx.n_nodes, ctx.active_modes)
         # Re-key from active-mode position to variable index
         var_coeffs = Dict(ctx.active_modes[ai] => c for (ai, c) in phase_coeffs)
@@ -738,7 +729,7 @@ function _build_top_level_hilbertspace(ctx::HierarchyContext,
     ej_current_vals = _get_josephson_ej_values(circ)
     for (jj_idx, (_, phase_sym)) in enumerate(sc.josephson_terms)
         ej_val = ej_current_vals[jj_idx]
-        phase_coeffs, ext_phase = _extract_phase_info(circ, phase_sym, ctx.T_inv,
+        phase_coeffs, ext_phase = _extract_phase_info(circ, phase_sym, ctx.mode_transform,
                                                        ctx.n_nodes, ctx.active_modes)
         var_coeffs = Dict(ctx.active_modes[ai] => c for (ai, c) in phase_coeffs)
         children_involved = Dict{Int, Vector{Tuple{Int, Float64}}}()

@@ -22,16 +22,27 @@ function hamiltonian(o::KerrOscillator)
     return o.E_osc * n_op - o.K * n_op * (n_op - I_op)
 end
 
+function _kerr_diagonal_energies(o::KerrOscillator)
+    return Float64[(o.E_osc + o.K) * k - o.K * k^2
+                   for k in 0:(o.truncated_dim - 1)]
+end
+
+function _kerr_lowest_indices(o::KerrOscillator, evals_count::Int)
+    n = clamp(evals_count, 0, o.truncated_dim)
+    n == 0 && return Int[]
+    return sortperm(_kerr_diagonal_energies(o); alg=MergeSort)[1:n]
+end
+
 function eigenvals(o::KerrOscillator; evals_count::Int=o.truncated_dim)
-    n = min(evals_count, o.truncated_dim)
-    return Float64[(o.E_osc + o.K) * k - o.K * k^2 for k in 0:(n - 1)]
+    energies = _kerr_diagonal_energies(o)
+    return energies[_kerr_lowest_indices(o, evals_count)]
 end
 
 function eigensys(o::KerrOscillator; evals_count::Int=o.truncated_dim)
-    vals = eigenvals(o; evals_count=evals_count)
-    n = length(vals)
-    vecs = Matrix{ComplexF64}(I, o.truncated_dim, n)
-    return vals, vecs
+    energies = _kerr_diagonal_energies(o)
+    indices = _kerr_lowest_indices(o, evals_count)
+    vecs = Matrix{ComplexF64}(I, o.truncated_dim, o.truncated_dim)[:, indices]
+    return energies[indices], vecs
 end
 
 annihilation_operator(o::KerrOscillator) = destroy(o.truncated_dim)

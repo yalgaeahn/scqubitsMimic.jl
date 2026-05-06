@@ -53,14 +53,6 @@ function hamiltonian(hs::HilbertSpace)
 
     # Interaction terms
     for term in hs.interactions
-        ops = QuantumObject[]
-        for (s, op_func) in zip(term.subsys_list, term.op_list)
-            idx = findfirst(==(s), hs.subsystems)
-            idx === nothing && error("Subsystem not found in HilbertSpace")
-            push!(ops, op_func(s))
-        end
-
-        # Build tensor product of interaction operators
         interaction_op = _build_interaction_operator(hs, term)
         H = H + term.g_strength * interaction_op
     end
@@ -83,6 +75,7 @@ function _build_interaction_operator(hs::HilbertSpace, term::InteractionTerm)
 
     for (s, op_func) in zip(term.subsys_list, term.op_list)
         idx = findfirst(==(s), hs.subsystems)
+        idx === nothing && error("Subsystem not found in HilbertSpace")
         op_per_subsys[idx] = op_func(s)
     end
 

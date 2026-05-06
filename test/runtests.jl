@@ -11,6 +11,12 @@ function dense_lowest_eigensys(sys, evals_count)
     return Float64.(result.values), ComplexF64.(result.vectors)
 end
 
+mutable struct CountingDisplay <: AbstractDisplay
+    calls::Base.RefValue{Int}
+end
+
+Base.display(display::CountingDisplay, x) = (display.calls[] += 1; nothing)
+
 @testset "ScQubitsMimic.jl" begin
 
     @testset "Grid1d" begin
@@ -21,6 +27,47 @@ end
         @test pts[1] ≈ -π
         @test pts[end] ≈ π
         @test grid_spacing(g) ≈ 2π / 100
+    end
+
+    @testset "Circuit grid-basis charging operators" begin
+        desc = """
+branches:
+  - [L, 0, 1, EL=0.7]
+  - [C, 0, 1, EC=0.25]
+"""
+        dim = 7
+        phi_range = (-3.0, 3.0)
+        circ = Circuit(desc; cutoff_ext=dim, ext_basis=:grid, phi_range=phi_range)
+        active_modes = vcat(circ.var_categories.periodic, circ.var_categories.extended)
+        dims = ScQubitsMimic._subsystem_dims(circ)
+        mode_ops = ScQubitsMimic._build_mode_operators(circ, active_modes, dims)
+        grid = Grid1d(phi_range[1], phi_range[2], dim)
+        d = sparse(d_dphi_operator_grid(grid).data)
+        d2 = sparse(d2_dphi2_operator_grid(grid).data)
+
+        @test active_modes == [1]
+        @test Matrix(mode_ops[1].n_op) ≈ Matrix(-1im * d) atol=1e-12
+        @test Matrix(mode_ops[1].n2_op) ≈ Matrix(-d2) atol=1e-12
+        @test !isapprox(Matrix(mode_ops[1].n_op), Matrix(mode_ops[1].n2_op); atol=1e-12)
+
+        T = circ.transformation_matrix
+        T_inv = inv(T)
+        ec_float = inv(ScQubitsMimic._build_capacitance_matrix_numeric(circ)) ./ 2
+        ec_transformed = T_inv * ec_float * T_inv'
+        l_transformed = T' * ScQubitsMimic._build_inv_inductance_matrix_numeric(circ) * T
+        expected = 4 * ec_transformed[1, 1] * mode_ops[1].n2_op +
+                   0.5 * l_transformed[1, 1] * mode_ops[1].phi_op * mode_ops[1].phi_op
+        old_n = -d2
+        old_fourth_derivative = 4 * ec_transformed[1, 1] * old_n * old_n +
+                                0.5 * l_transformed[1, 1] * mode_ops[1].phi_op * mode_ops[1].phi_op
+        H = sparse(hamiltonian(circ).data)
+
+        @test Matrix(H) ≈ Matrix(expected) atol=1e-10
+        @test norm(Matrix(H - old_fourth_derivative)) > 1e-6
+
+        direct_evals = eigenvals(circ; evals_count=4)
+        configure!(circ; system_hierarchy=[[1]], subsystem_trunc_dims=[dim])
+        @test eigenvals(circ._hilbert_space; evals_count=4) ≈ direct_evals atol=1e-10
     end
 
     @testset "Unit conversion" begin
@@ -80,6 +127,17 @@ end
         ω01 = evals[2] - evals[1]
         ω12 = evals[3] - evals[2]
         @test ω12 < ω01
+
+        inverted = KerrOscillator(E_osc=1.0, K=1.0, truncated_dim=6)
+        inverted_vals, inverted_vecs = eigensys(inverted; evals_count=3)
+        @test eigenvals(inverted; evals_count=3) == [-15.0, -8.0, -3.0]
+        @test inverted_vals == [-15.0, -8.0, -3.0]
+        @test inverted_vecs == Matrix{ComplexF64}(I, 6, 6)[:, [6, 5, 4]]
+        H_inverted = Matrix(hamiltonian(inverted).data)
+        for col in axes(inverted_vecs, 2)
+            v = inverted_vecs[:, col]
+            @test H_inverted * v ≈ inverted_vals[col] * v atol=1e-12
+        end
     end
 
     @testset "Circuit graph parsing" begin
@@ -236,6 +294,22 @@ branches:
         circ = Circuit(desc; ncut=6)
 
         @test string.(external_fluxes(circ)) == ["Φ1", "Φ2", "Φ3"]
+        @test circ.external_flux_values == zeros(3)
+        input_fluxes = [0.1, 0.2, 0.3]
+        circ_with_fluxes = Circuit(desc; ncut=6, external_fluxes=input_fluxes)
+        @test circ_with_fluxes.external_flux_values == input_fluxes
+        input_fluxes[1] = 9.0
+        @test circ_with_fluxes.external_flux_values == [0.1, 0.2, 0.3]
+        @test_throws ArgumentError Circuit(desc; ncut=6, external_fluxes=[0.1])
+        @test_throws ArgumentError Circuit(desc; ncut=6, external_fluxes=[0.1, 0.2, 0.3, 0.4])
+
+        no_flux_desc = """
+branches:
+  - [JJ, 0, 1, EJ=10.0, EC=0.3]
+  - [C, 0, 1, EC=0.5]
+"""
+        @test isempty(Circuit(no_flux_desc; ncut=6).external_flux_values)
+        @test_throws ArgumentError Circuit(no_flux_desc; ncut=6, external_fluxes=[0.1])
         @test string.(offset_charges(circ)) == ["ng1", "ng2", "ng3"]
         flux_map = sym_external_fluxes(circ)
         @test length(flux_map) == 3
@@ -326,7 +400,15 @@ branches:
         @test circ.var_categories.periodic == [2]
         @test circ.var_categories.extended == [1]
 
-        eqs = offset_charge_transformation(circ)
+        display_calls = Ref(0)
+        test_display = CountingDisplay(display_calls)
+        pushdisplay(test_display)
+        eqs = try
+            offset_charge_transformation(circ)
+        finally
+            popdisplay(test_display)
+        end
+        @test display_calls[] == 0
         @test length(eqs) == 1
         eq = eqs[1]
         @test string(eq.lhs) == "ng2"
@@ -401,6 +483,23 @@ branches:
         # energy_by_bare_index should give same result
         @test energy_by_bare_index(hs, 1, 1) ≈ lookup.dressed_evals[1]
         @test energy_by_bare_index(hs, (1, 1); subtract_ground=true) ≈ 0.0 atol=1e-12
+    end
+
+    @testset "HilbertSpace interaction operator evaluation" begin
+        osc1 = Oscillator(E_osc=5.0, truncated_dim=3)
+        osc2 = Oscillator(E_osc=6.0, truncated_dim=3)
+        hs = HilbertSpace([osc1, osc2])
+        calls = Ref(0)
+        op_once = s -> begin
+            calls[] += 1
+            annihilation_operator(s) + creation_operator(s)
+        end
+        add_interaction!(hs, 0.05, [osc1, osc2], Function[op_once, op_once])
+
+        hamiltonian(hs)
+        @test calls[] == 2
+        hamiltonian(hs)
+        @test calls[] == 4
     end
 
     @testset "SpectrumLookup from precomputed eigensystems" begin
@@ -650,7 +749,7 @@ branches:
         osc_b = Oscillator(E_osc=6.0, truncated_dim=3)
         hs_info = HilbertSpace([osc_a, osc_b])
         sweep_info = ParameterSweep(hs_info,
-            Dict(:ωa => [5.0, 5.2], :ωb => [6.0, 6.3]),
+            [:ωa => [5.0, 5.2], :ωb => [6.0, 6.3]],
             (hs, vals) -> begin
                 hs.subsystems[1].E_osc = vals[:ωa]
                 hs.subsystems[2].E_osc = vals[:ωb]
@@ -665,6 +764,27 @@ branches:
         @test sweep_info.bare_evals[1][slow_subsys] === sweep_info.bare_evals[2][slow_subsys]
         @test sweep_info.bare_evecs[1][fast_subsys] !== sweep_info.bare_evecs[2][fast_subsys]
         @test sweep_info.bare_evecs[1][slow_subsys] === sweep_info.bare_evecs[2][slow_subsys]
+
+        ordered_calls = Tuple{Float64, Float64}[]
+        sweep_order = ParameterSweep(HilbertSpace([Oscillator(E_osc=5.0, truncated_dim=2),
+                                                   Oscillator(E_osc=6.0, truncated_dim=2)]),
+            (:ωb => [6.0, 6.3], :ωa => [5.0, 5.2]),
+            (sweep, ωb, ωa) -> push!(ordered_calls, (ωb, ωa));
+            evals_count=3,
+            bare_only=true)
+        @test sweep_order.param_order == [:ωb, :ωa]
+        @test ordered_calls[1] == (6.0, 5.0)
+        @test ScQubitsMimic._parameter_point_index(sweep_order, (2, 1)) == 2
+
+        dict_calls = Tuple{Float64, Float64}[]
+        sweep_dict = ParameterSweep(HilbertSpace([Oscillator(E_osc=5.0, truncated_dim=2),
+                                                  Oscillator(E_osc=6.0, truncated_dim=2)]),
+            Dict(:ωb => [6.0, 6.3], :ωa => [5.0, 5.2]),
+            (sweep, ωa, ωb) -> push!(dict_calls, (ωa, ωb));
+            evals_count=3,
+            bare_only=true)
+        @test sweep_dict.param_order == [:ωa, :ωb]
+        @test dict_calls[1] == (5.0, 6.0)
     end
 
     @testset "ParameterSweep labeling scheme keywords" begin
@@ -715,7 +835,7 @@ branches:
              s -> annihilation_operator(s) + creation_operator(s)])
 
         sweep_auto = ParameterSweep(hs,
-            Dict(:ω1 => [5.0, 5.3], :ω2 => [6.0, 6.2]),
+            [:ω1 => [5.0, 5.3], :ω2 => [6.0, 6.2]],
             (hs, vals) -> begin
                 hs.subsystems[1].E_osc = vals[:ω1]
                 hs.subsystems[2].E_osc = vals[:ω2]
@@ -729,7 +849,7 @@ branches:
             [s -> annihilation_operator(s) + creation_operator(s),
              s -> annihilation_operator(s) + creation_operator(s)])
         sweep_post = ParameterSweep(hs_post,
-            Dict(:ω1 => [5.0, 5.3], :ω2 => [6.0, 6.2]),
+            [:ω1 => [5.0, 5.3], :ω2 => [6.0, 6.2]],
             (hs, vals) -> begin
                 hs.subsystems[1].E_osc = vals[:ω1]
                 hs.subsystems[2].E_osc = vals[:ω2]
@@ -871,7 +991,7 @@ branches:
             [s -> annihilation_operator(s) + creation_operator(s),
              s -> annihilation_operator(s) + creation_operator(s)])
         sweep2d = ParameterSweep(hs2d,
-            Dict(:ω1 => [5.0, 5.2], :ω2 => [6.0, 6.2]),
+            [:ω1 => [5.0, 5.2], :ω2 => [6.0, 6.2]],
             (hs, vals) -> begin
                 hs.subsystems[1].E_osc = vals[:ω1]
                 hs.subsystems[2].E_osc = vals[:ω2]
@@ -949,6 +1069,20 @@ branches:
 
     @testset "Normal-mode decomposition" begin
         Sym = ScQubitsMimic.Symbolics  # access Symbolics via parent module
+        function cross_coeff(expr, x, y, vars)
+            all_vars = unique(vcat(Any[Sym.unwrap(v) for v in Sym.get_variables(expr)],
+                                   Any[Sym.unwrap(v) for v in vars]))
+            x_unwrapped = Sym.unwrap(x)
+            y_unwrapped = Sym.unwrap(y)
+            function eval_at(xval, yval)
+                subs = Dict(v => (isequal(v, x_unwrapped) ? xval :
+                                  isequal(v, y_unwrapped) ? yval : 0.0)
+                            for v in all_vars)
+                return Float64(Sym.value(Sym.substitute(expr, subs)))
+            end
+            return eval_at(1.0, 1.0) - eval_at(1.0, 0.0) -
+                   eval_at(0.0, 1.0) + eval_at(0.0, 0.0)
+        end
 
         # Single-node Transmon: identity transform unchanged
         desc1 = """
@@ -989,6 +1123,36 @@ branches:
         C_mat = Float64.(Sym.value.(sc2.capacitance_matrix))
         C_t = T2' * C_mat * T2
         @test C_t ≈ Matrix{Float64}(I, 2, 2) atol=1e-10
+        @test ScQubitsMimic._branch_mode_coeff(cg2.branches[1], T2, 1) ≈ T2[1, 1]
+
+        circ2 = Circuit(desc2; cutoff_ext=4, ext_basis=:harmonic)
+        θ1, θ2 = Sym.variable(:θ, 1), Sym.variable(:θ, 2)
+        nθ1, nθ2 = Sym.variable(:nθ, 1), Sym.variable(:nθ, 2)
+        θ̇1, θ̇2 = Sym.variable(:θ̇, 1), Sym.variable(:θ̇, 2)
+
+        H_mode = circ2.mode_hamiltonian_symbolic
+        @test abs(cross_coeff(H_mode, θ1, θ2, [θ1, θ2, nθ1, nθ2])) < 1e-10
+        @test abs(cross_coeff(H_mode, nθ1, nθ2, [θ1, θ2, nθ1, nθ2])) < 1e-10
+
+        L_new = sym_lagrangian(circ2; vars_type=:new)
+        @test abs(cross_coeff(L_new, θ1, θ2, [θ1, θ2, θ̇1, θ̇2])) < 1e-10
+        @test abs(cross_coeff(L_new, θ̇1, θ̇2, [θ1, θ2, θ̇1, θ̇2])) < 1e-10
+
+        desc_coupled_jj = """
+branches:
+  - [L, 0, 1, EL=0.7]
+  - [C, 0, 1, EC=0.4]
+  - [L, 0, 2, EL=0.9]
+  - [C, 0, 2, EC=0.5]
+  - [C, 1, 2, EC=0.25]
+  - [JJ, 1, 2, EJ=0.15, EC=20.0]
+"""
+        circ_jj = Circuit(desc_coupled_jj; cutoff_ext=4, ext_basis=:harmonic)
+        direct_evals = eigenvals(circ_jj; evals_count=6)
+        hs_jj = hierarchical_diag(circ_jj;
+            system_hierarchy=[[1], [2]],
+            subsystem_trunc_dims=[4, 4])
+        @test eigenvals(hs_jj; evals_count=6) ≈ direct_evals atol=1e-8
 
         # Single extended mode (Fluxonium-like): identity still correct
         desc3 = """
@@ -1981,7 +2145,7 @@ branches:
 
         sweep_rebuild = ParameterSweep(
             build_hs_rebuild(; flux_cplr=first(phi_vals), flux_qb2=first(phi_vals)),
-            Dict(:Φ1 => phi_vals, :Φ2 => phi_vals),
+            [:Φ1 => phi_vals, :Φ2 => phi_vals],
             (sweep, flux_cplr, flux_qb2) -> begin
                 sweep.hilbertspace = build_hs_rebuild(; flux_cplr=flux_cplr, flux_qb2=flux_qb2)
             end;
@@ -1993,7 +2157,7 @@ branches:
         circ_reuse = build_configured_circuit(; flux_cplr=first(phi_vals), flux_qb2=first(phi_vals))
         sweep_reuse = ParameterSweep(
             circ_reuse._hilbert_space,
-            Dict(:Φ1 => phi_vals, :Φ2 => phi_vals),
+            [:Φ1 => phi_vals, :Φ2 => phi_vals],
             (sweep, flux_cplr, flux_qb2) -> begin
                 set_param!(circ_reuse, :Φ1, flux_bias_to_rad(flux_cplr))
                 set_param!(circ_reuse, :Φ2, flux_bias_to_rad(flux_qb2))

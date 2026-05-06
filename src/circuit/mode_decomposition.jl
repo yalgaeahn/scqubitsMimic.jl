@@ -1,8 +1,8 @@
 # ──────────────────────────────────────────────────────────────────────────────
 # Mode decomposition: variable transformation and classification
 #
-# Transforms node flux variables (φ_1, φ_2, ...) into normal mode variables
-# (θ_1, θ_2, ...) and classifies each mode as periodic, extended, free, or frozen.
+# Builds normal mode variables (θ_1, θ_2, ...) using the convention φ = Tθ,
+# and classifies each mode as periodic, extended, free, or frozen.
 #
 # Classification rules (per node in the identity-transformed basis):
 #   periodic: connected to JJ but NOT to any inductor → compact phase, charge basis
@@ -49,7 +49,7 @@ end
 Compute the transformation matrix T and variable classification.
 
 Returns `(T, var_categories)` where:
-- `T` is an N×N matrix mapping node fluxes to mode variables: θ = T * φ
+- `T` is an N×N matrix mapping mode fluxes to node fluxes: φ = T * θ
 - `var_categories::VarCategories` classifies each θ_i
 """
 function compute_variable_transformation(sc::SymbolicCircuit)
@@ -173,8 +173,8 @@ function transform_hamiltonian(sc::SymbolicCircuit, T::Matrix{Float64},
     n = sc.graph.num_nodes
     T_inv = inv(T)
 
-    # Transformed EC matrix: EC_θ = T^{-T} * EC * T^{-1}
-    ec_transformed = T_inv' * Float64.(Symbolics.value.(sc.ec_matrix)) * T_inv
+    # Transformed EC matrix for φ = Tθ: EC_θ = T^{-1} * EC * T^{-T}
+    ec_transformed = T_inv * Float64.(Symbolics.value.(sc.ec_matrix)) * T_inv'
 
     # Mode charge variables
     mode_charges = [Symbolics.variable(:nθ, i) for i in 1:n]
@@ -188,8 +188,8 @@ function transform_hamiltonian(sc::SymbolicCircuit, T::Matrix{Float64},
     end
 
     # Inductive energy in mode basis: branch-level with external flux
-    # Substitute φ_i → Σ_j T_inv[i,j] θ_j into each inductor's branch flux
-    node_subs = Dict(sc.node_vars[i] => sum(T_inv[i, j] * mode_phases[j] for j in 1:n)
+    # Substitute φ_i → Σ_j T[i,j] θ_j into each inductor's branch flux
+    node_subs = Dict(sc.node_vars[i] => sum(T[i, j] * mode_phases[j] for j in 1:n)
                       for i in 1:n)
 
     H_inductive = Num(0)
@@ -201,7 +201,7 @@ function transform_hamiltonian(sc::SymbolicCircuit, T::Matrix{Float64},
         H_inductive += el / 2 * branch_flux_mode^2
     end
 
-    # Josephson terms: substitute φ = T^{-1} θ
+    # Josephson terms: substitute φ = Tθ
     H_josephson = Num(0)
     for (ej, phase_expr) in sc.josephson_terms
         new_phase = Symbolics.substitute(phase_expr, node_subs)
